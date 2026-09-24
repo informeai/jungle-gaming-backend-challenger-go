@@ -1,0 +1,124 @@
+# Local environment: PostgreSQL, Keycloak (IdP), LocalStack (SQS) and three
+# independent instances of the wallet service (own process, memory and pool).
+#
+#   docker compose up --build            # everything
+#   docker compose up -d postgres keycloak localstack   # only test dependencies
+
+x-app: &app
+  build: .
+  image: jungle-wallet-service:local
+  restart: unless-stopped
+  environment: &app-env
+    DATABASE_URL: postgres://wallet_app:wallet_app_local@postgres:5432/wallet?sslmode=disable
+    DATABASE_MAX_CONNS: "20"
+    AWS_REGION: us-east-1
+    AWS_ENDPOINT_URL: http://localstack:4566
+    AWS_ACCESS_KEY_ID: wallet-service
+    AWS_SECRET_ACCESS_KEY: wallet-service-local
+    SQS_INGRESS_QUEUE: wager-transactions.fifo
+    SQS_INGRESS_DLQ: wager-transactions-dlq.fifo
+    SQS_EVENTS_QUEUE: wallet-events.fifo
+    SQS_ALLOWED_PROVIDERS: provider-a,provider-b
+    OIDC_ISSUER: http://localhost:8180/realms/jungle
+    OIDC_JWKS_URL: http://keycloak:8080/realms/jungle/protocol/openid-connect/certs
+    OIDC_AUDIENCE: wallet-api
+    LOG_LEVEL: info
+  depends_on:
+    migrate:
+      condition: service_completed_successfully
+    keycloak:
+      condition: service_healthy
+    localstack:
+      condition: service_healthy
+  healthcheck:
+    test: ["CMD", "wget", "-qO-", "http://localhost:8080/health/ready"]
+    interval: 5s
+    timeout: 3s
+    retries: 20
+  stop_grace_period: 40s
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: wallet
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports: ["5432:5432"]
+    volumes:
+      - ./deploy/postgres/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+      - pgdata:/var/lib/postgresql/data
+    command: ["postgres", "-c", "max_connections=300"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d wallet"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.3
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      KC_HOSTNAME: http://localhost:8180
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "false"
+      KC_HEALTH_ENABLED: "true"
+    ports: ["8180:8080"]
+    volumes:
+      - ./deploy/keycloak/jungle-realm.json:/opt/keycloak/data/import/jungle-realm.json:ro
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/9000 && printf 'GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && grep -q UP <&3"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+
+  localstack:
+    image: localstack/localstack:4.7
+    environment:
+      SERVICES: sqs
+      AWS_DEFAULT_REGION: us-east-1
+      SQS_ENDPOINT_STRATEGY: standard
+    ports: ["4566:4566"]
+    volumes:
+      - ./deploy/localstack/init-sqs.sh:/etc/localstack/init/ready.d/init-sqs.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "awslocal sqs get-queue-url --queue-name wallet-events.fifo >/dev/null 2>&1"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+
+  migrate:
+    build: .
+    image: jungle-wallet-service:local
+    command: ["migrate", "up"]
+    environment:
+      MIGRATIONS_DATABASE_URL: postgres://postgres:postgres@postgres:5432/wallet?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api-1:
+    <<: *app
+    environment:
+      <<: *app-env
+      INSTANCE_ID: api-1
+    ports: ["8081:8080"]
+
+  api-2:
+    <<: *app
+    environment:
+      <<: *app-env
+      INSTANCE_ID: api-2
+    ports: ["8082:8080"]
+
+  api-3:
+    <<: *app
+    environment:
+      <<: *app-env
+      INSTANCE_ID: api-3
+    ports: ["8083:8080"]
+
+volumes:
+  pgdata:

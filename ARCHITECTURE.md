@@ -121,9 +121,43 @@ PROCESSED, REJECTED, FAILED: terminais (validado no domínio e por trigger)
 ### Falhas transitórias × permanentes
 
 - **Transitórias** (banco/SQS indisponível, timeout, serialização, deadlock): nada é commitado; HTTP responde `503` com `Retry-After` (reenvie com a mesma chave); SQS volta a mensagem para a fila com backoff; o worker tenta no próximo ciclo.
+  - **Conflitos** (serialização, deadlock, versão) são repetidos na hora, até 3 vezes, dentro da mesma requisição.
+  - **Indisponibilidade** (conexão, timeout, servidor fora) **não** é repetida na hora: repetir só multiplicaria a carga sobre uma dependência já em dificuldade. Quem cuida disso é o circuit breaker (abaixo).
 - **Entradas inválidas corrigíveis** (validação, carteira inexistente): não persistem nada; HTTP `400/404`; SQS → DLQ.
 - **Rejeições de negócio definitivas:** persistidas como `REJECTED` com `failureCode` e evento `WagerTransactionRejected`; replays devolvem a mesma rejeição.
 - **Falha permanente de processamento** (erro não transitório inesperado ao retomar uma pendência, ex.: dado corrompido): a transação vai para `FAILED` com `PERMANENT_PROCESSING_ERROR` para auditoria, em vez de ficar em loop.
+
+### Circuit breakers
+
+Há um breaker por dependência: `postgres` (pool `wallet_app`), `postgres-outbox` (pool do relay) e `sqs`. Implementação em `internal/resilience`, sobre o `sony/gobreaker`.
+
+- **O que conta como falha:** só indisponibilidade (conexão recusada, timeout, erro de conexão do servidor, 5xx ou sem resposta do SQS). Erros de negócio, validação, violação de constraint, conflitos de serialização e cancelamento do cliente não contam, porque provam que a dependência respondeu.
+- **Estados:**
+  - **fechado:** tudo normal;
+  - **aberto:** depois de `BREAKER_FAILURE_THRESHOLD` falhas seguidas (padrão 5), fica aberto por `BREAKER_OPEN_TIMEOUT` (padrão 5s);
+  - **meio-aberto:** deixa passar **uma** sonda; se ela funcionar, fecha, senão volta a abrir.
+- **API com o breaker aberto:** responde `503 SERVICE_UNAVAILABLE` em milissegundos, com `Retry-After` igual ao tempo de abertura, sem abrir conexão com o banco. A readiness da instância fica `DOWN`.
+- **Consumidor SQS:** antes de cada leitura, espera os *gates* do Postgres e do SQS; enquanto um breaker não está fechado, **não lê a fila**. A sonda do meio-aberto é um ping, nunca uma mensagem, então a queda não gasta o `receiveCount` de ninguém.
+  - Uma mensagem que já estava em processamento quando o breaker abriu volta para a fila sem aplicar a regra da DLQ.
+  - Se a falha aconteceu com alguma dependência não-fechada, a mensagem também não vai para a DLQ: a culpa é da dependência, não da mensagem.
+  - Com as dependências saudáveis e uma mensagem falhando repetidamente, a regra de `SQS_MAX_RECEIVES` continua valendo.
+- **Relay da outbox:** espera os gates do seu pool e do SQS antes de reservar eventos; se o breaker do SQS abre no meio de um lote, devolve os leases restantes. Os eventos não gastam tentativas durante a queda.
+- **Worker de referências:** espera o gate do banco.
+- **Prazos:** todo acesso tem prazo, senão uma dependência "pendurada" (aceita a conexão e nunca responde) nunca geraria falha e o breaker nunca abriria.
+  - HTTP: `HTTP_REQUEST_TIMEOUT`.
+  - Handler SQS: `SQS_HANDLER_TIMEOUT`.
+  - Long polling: `SQS_WAIT_TIME` + 10s.
+  - Ciclos dos workers: 10s no de pendências, 30s no relay.
+  - Controle da outbox: 5s.
+- **Consumidor com o SQS fora:** cada leitura leva até ~20s para falhar, então o breaker dele abre em ~100s. Nesse intervalo ele não recebe nem desperdiça mensagens, e a readiness já mostra `sqs-ingress: DOWN` pelo ping direto.
+- **Observabilidade:**
+  - métricas `circuit_breaker_state{name}` (0 fechado, 1 meio-aberto, 2 aberto) e `circuit_breaker_rejections_total{name}`;
+  - alerta `CircuitBreakerOpen`;
+  - painel *Circuit breakers* no Grafana;
+  - log a cada mudança de estado.
+- **Verificação:**
+  - testes `TestCircuitBreakerFailsFastAndRecovers`, `TestConsumerPausesDuringDatabaseOutage` e `TestRelayPausesDuringSQSOutage`, com um proxy TCP que "pendura" o Postgres ou o SQS;
+  - `make chaos-db` e `make chaos-sqs` contra a stack do compose.
 
 ### Regras por tipo
 
@@ -198,14 +232,16 @@ Códigos de validação (`400`, corrigíveis, não persistidos): ver README.
 | Sucesso ou rejeição de negócio commitada | `DeleteMessage`. Se o delete falhar, a reentrega é deduplicada. |
 | Envelope inválido, tipo desconhecido, validação, `OPENING`, provedor fora de `SQS_ALLOWED_PROVIDERS`, carteira inexistente, conflito de idempotência, hash divergente | Permanente: enviada à DLQ com atributos `dlqReason`, `sourceQueue`, `receiveCount` e removida da fila de entrada. |
 | Falha transitória | `ChangeMessageVisibility` com backoff exponencial (`SQS_RETRY_BASE_DELAY × 2^(n-1)`, até `SQS_RETRY_MAX_DELAY`), usando `ApproximateReceiveCount`. |
-| Tentativas esgotadas (`receiveCount >= SQS_MAX_RECEIVES`, padrão 5) | DLQ com `dlqReason=retries_exhausted`. |
+| Dependência indisponível (breaker aberto ou não-fechado) | Mensagem devolvida à fila **sem** aplicar o limite da DLQ; o consumidor pausa a leitura até a dependência voltar (ver [Circuit breakers](#circuit-breakers)). |
+| Tentativas esgotadas (`receiveCount >= SQS_MAX_RECEIVES`, padrão 5) com as dependências saudáveis | DLQ com `dlqReason=retries_exhausted`. |
 | Rede de segurança | `RedrivePolicy` da fila com `maxReceiveCount=8` (> `SQS_MAX_RECEIVES`) para o caso de um consumidor morrer sempre na mesma mensagem. |
 
 - **Visibility timeout** 30s; **prazo do handler** 10s (validado no start: precisa ser menor que a visibilidade, para a mensagem nunca ficar visível enquanto ainda é processada).
 - **`MessageGroupId`** = `walletId`: ordem FIFO por carteira e paralelismo entre carteiras. O consumidor processa mensagens do mesmo grupo **em sequência** e grupos diferentes em paralelo (`SQS_CONCURRENCY`); se uma mensagem do grupo vai para retry, as seguintes do mesmo lote são devolvidas para preservar a ordem.
 - **`MessageDeduplicationId`** = recomendado igual ao `messageId` do envelope (deduplicação do broker por 5 min). A deduplicação do SQS FIFO é só uma otimização: a correção vem da inbox e da idempotência no banco.
 - **SIGTERM:** o consumidor para de buscar (cancela o long polling), espera o trabalho em andamento até o prazo do shutdown; o que não terminou é cancelado (rollback) e tem a visibilidade liberada (`VisibilityTimeout=0`) para reentrega imediata em outra instância.
-- **Indisponibilidade do SQS:** o loop de recebimento faz backoff exponencial (até 10s) e a readiness passa a `503`. A outbox acumula e é drenada quando o SQS volta.
+- **Indisponibilidade do SQS:** o loop de recebimento faz backoff exponencial (até 10s) e o breaker `sqs` abre após falhas seguidas; a readiness passa a `503`. A outbox acumula (relays pausados pelo breaker) e é drenada quando o SQS volta.
+- **Indisponibilidade do Postgres:** o breaker `postgres` abre e o consumidor para de ler a fila; as mensagens esperam no SQS sem gastar tentativas e são processadas quando o banco volta (nenhuma vai para a DLQ por causa da queda).
 
 ## Transactional outbox
 

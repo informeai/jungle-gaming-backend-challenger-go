@@ -159,7 +159,7 @@ Resultados persistidos (a operação existe no banco) sempre têm o corpo abaixo
 | `403` | papel insuficiente (`FORBIDDEN`) ou `providerId` diferente do token (`PROVIDER_MISMATCH`) | erro |
 | `404` | `WALLET_NOT_FOUND` (nada persistido) | erro |
 | `409` | `IDEMPOTENCY_KEY_CONFLICT` (mesma chave, conteúdo diferente) ou `EXTERNAL_TRANSACTION_CONFLICT` (mesmo `externalTransactionId` com outra chave) | erro |
-| `503` | indisponibilidade transitória (banco, timeout); header `Retry-After`; repita com a **mesma** chave | erro `SERVICE_UNAVAILABLE` |
+| `503` | indisponibilidade transitória (banco, timeout) ou circuit breaker aberto (resposta imediata); header `Retry-After`; repita com a **mesma** chave | erro `SERVICE_UNAVAILABLE` |
 | `500` | erro inesperado | erro `INTERNAL_ERROR` |
 
 Códigos de validação (`400`): `MALFORMED_REQUEST` (JSON inválido, campo desconhecido, `amount` numérico), `IDEMPOTENCY_KEY_REQUIRED`, `MISSING_FIELD`, `INVALID_FIELD`, `INVALID_KIND`, `OPENING_NOT_ALLOWED`, `INVALID_MONEY`, `AMOUNT_MUST_BE_POSITIVE`, `LOSS_AMOUNT_MUST_BE_ZERO`, `REFERENCE_REQUIRED`, `REFERENCE_NOT_ALLOWED`, `SELF_REFERENCE`, `INVALID_CURSOR`, `INVALID_LIMIT`.
@@ -239,6 +239,7 @@ Todas têm valores de exemplo em [`.env.example`](.env.example). As principais:
 | `OIDC_JWKS_URL` | `<issuer>/protocol/openid-connect/certs` | JWKS (no compose: `http://keycloak:8080/...`). |
 | `OIDC_AUDIENCE` | `wallet-api` | Audiência exigida. |
 | `OIDC_PROVIDER_CLAIM`, `OIDC_PROVIDER_ROLE`, `OIDC_INTERNAL_ROLE` | `provider_id`, `wagering-provider`, `wallet-internal` | Modelo de permissões. |
+| `BREAKER_FAILURE_THRESHOLD`, `BREAKER_OPEN_TIMEOUT` | `5`, `5s` | Circuit breakers: falhas de indisponibilidade seguidas para abrir e tempo aberto antes da sonda. |
 | `FAULT_INJECTION` | vazio | Somente testes: `consumer-crash-after-commit` ou `outbox-crash-after-publish`. |
 
 ## Testes
@@ -286,9 +287,48 @@ Cada execução cria um banco novo (`it_<id>`, removido ao final; `IT_KEEP_DB=1`
 | `TestRestartPreservesState` | SIGKILL e novo processo: replay devolve o resultado original, pendência é retomada, saldo consistente. |
 | `TestThreeIndependentProcesses` | Três processos: 50 duplicatas, disputa 80/80 entre processos distintos, carteiras em paralelo com HTTP + SQS simultâneos. |
 | `TestFxLifecycle` | Composição Fx: start, workers ativos, stop, workers encerrados, pool fechado, servidor sem conexões. |
+| `TestCircuitBreakerFailsFastAndRecovers` | Postgres "pendurado" (aceita TCP, nunca responde): o breaker abre após 3 chamadas lentas, depois 20 requisições respondem `503` em < 300 ms com `Retry-After` e **zero** conexões ao banco morto; readiness `DOWN`; recuperação por sonda. |
+| `TestConsumerPausesDuringDatabaseOutage` | Banco pendurado por 12s com `SQS_MAX_RECEIVES=2`: nenhuma mensagem válida vai para a DLQ; todas processadas depois. |
+| `TestRelayPausesDuringSQSOutage` | SQS pendurado: o relay para de reservar eventos (≤ 2 tentativas) e publica tudo quando o SQS volta. |
 | `TestPostgresTemporarilyUnavailable` | Proxy TCP derruba o banco: `503` + readiness `DOWN`, nada persistido; após a volta, a mesma chave processa uma única vez. |
 
 Unitários cobrem `Money` (parsing, escala, limites de `int64`, overflow, `NaN`/`Infinity`/notação científica, moedas incompatíveis, JSON), invariantes da carteira e do lançamento, máquina de estados, regras e política de zero dos cinco tipos externos, abertura interna (metadados e eventos), fingerprint canônico, conflito de payload para a mesma chave, inbox, validação de tokens (assinatura, issuer, audiência, expiração) e `fx.ValidateApp` do grafo.
+
+### Simulação de queda (circuit breakers)
+
+```sh
+make chaos-db                 # congela o Postgres por 45s (DURATION=60 para mudar)
+make chaos-sqs                # congela o LocalStack (SQS)
+make db-down / make db-up     # congelar/descongelar manualmente (idem sqs-down / sqs-up)
+```
+
+`docker compose pause` congela o container: ele aceita a conexão TCP e nunca responde, o pior tipo de queda.
+
+**`chaos-db`:**
+1. Abre 5 carteiras.
+2. Congela o Postgres.
+3. Dispara 8 apostas simultâneas na api-1 (esperam o timeout e abrem o breaker) e uma aposta por carteira pela fila.
+4. Mostra as apostas seguintes respondendo `503` em milissegundos, com `Retry-After`, e a readiness `DOWN`.
+5. Descongela o banco e mostra a recuperação.
+
+Saída real:
+
+```
+== with the breaker open: fail fast, nothing sent to the frozen database
+   bet 1: HTTP 503 in 5.03s (Retry-After: 1)  <- half-open probe: this one request tests the database
+   bet 2: HTTP 503 in 0.015s (Retry-After: 5)
+   bet 3: HTTP 503 in 0.002s (Retry-After: 5)
+   breakers: api-1[postgres:half-open] consumer-1[postgres:half-open ...] pending-worker-1[postgres:OPEN]
+== unfreezing PostgreSQL
+   API recovered in 1s (breaker half-open probe succeeded)
+   SQS bet 0..4: PROCESSED
+   valid messages in the DLQ from this run: 0
+   consistent=True stored=98.00 ledger=98.00
+```
+
+**`chaos-sqs`:** mostra a API funcionando sem o SQS, os eventos esperando na outbox (no máximo 2 tentativas), os breakers dos relays abertos e tudo publicado ~1s depois da volta.
+
+Com `make observability`, acompanhe no painel *Circuit breakers* do Grafana e no alerta `CircuitBreakerOpen`.
 
 ### Múltiplas instâncias e simulação de falhas manualmente
 
@@ -322,7 +362,7 @@ Não há meta de RPS; os números servem de linha de base e **variam bastante co
 ## Observabilidade
 
 - **Logs** JSON (`log/slog`) com `instanceId`, `correlationId` (header `X-Correlation-Id` ou gerado), `messageId`, `transactionId`, `walletId`, `providerId`, `eventId`. Corpos de requisição, tokens e payloads financeiros completos não são registrados.
-- **Métricas** em `/metrics`: `wager_transactions_total{source,kind,status,replay}`, `wager_duplicates_total`, `wager_idempotency_conflicts_total`, `wallet_concurrency_conflicts_total`, `wager_processing_seconds`, `wager_reference_retries_total`, `sqs_messages_total{outcome}`, `sqs_message_retries_total`, `sqs_dlq_messages_total{reason}`, `outbox_published_total`, `outbox_publish_failures_total`, `outbox_pending_events`, `outbox_lag_seconds`, `outbox_publish_delay_seconds`, `wallet_reconciliations_total`, `wallet_reconciliation_divergences_total`, `http_requests_total`.
+- **Métricas** em `/metrics`: `wager_transactions_total{source,kind,status,replay}`, `wager_duplicates_total`, `wager_idempotency_conflicts_total`, `wallet_concurrency_conflicts_total`, `wager_processing_seconds`, `wager_reference_retries_total`, `sqs_messages_total{outcome}`, `sqs_message_retries_total`, `sqs_dlq_messages_total{reason}`, `outbox_published_total`, `outbox_publish_failures_total`, `outbox_pending_events`, `outbox_lag_seconds`, `outbox_publish_delay_seconds`, `wallet_reconciliations_total`, `wallet_reconciliation_divergences_total`, `http_requests_total`, `circuit_breaker_state{name}`, `circuit_breaker_rejections_total{name}`.
 - **Health**: `/health/live` e `/health/ready`.
 
 ### Prometheus e Grafana (opcional)
@@ -344,7 +384,7 @@ O dashboard tem filtro por componente e seis seções:
 - **Mensageria:** resultados do consumidor, retries, DLQ e motivos de DLQ.
 - **Outbox:** pendentes, atraso e publicações.
 - **Referências e reconciliação.**
-- **Saúde:** UP/DOWN de cada instância e requisições HTTP por classe de status.
+- **Saúde:** UP/DOWN de cada instância, requisições HTTP por classe de status e estado de cada circuit breaker (fechado, meio-aberto, aberto).
 
 Regras de alerta:
 
@@ -356,6 +396,7 @@ Regras de alerta:
 | `MessagesSentToDLQ` | mensagem movida para a DLQ nos últimos 5 min |
 | `ReconciliationDivergence` | divergência entre saldo e ledger em 15 min |
 | `HighTransientErrorRate` | API respondendo 503 |
+| `CircuitBreakerOpen` | breaker de uma dependência aberto por 15s |
 
 Não há Alertmanager configurado: localmente os alertas aparecem só na UI do Prometheus.
 
@@ -375,6 +416,7 @@ internal/infra         adaptadores: postgres (pgx, repositórios, migrations), s
 internal/httpapi       rotas net/http, autenticação/autorização, mapeamento de erros
 internal/auth          validação OIDC (JWKS, issuer, audiência, expiração) e política de papéis
 internal/worker        relay da outbox, worker de referências pendentes, loop com término observável
+internal/resilience    circuit breakers por dependência e gates que pausam consumidores/relays
 internal/bootstrap     composição Fx (fx.Module/Provide/Invoke + lifecycle)
 internal/observability logger JSON e métricas
 migrations/            SQL versionado (up/down)

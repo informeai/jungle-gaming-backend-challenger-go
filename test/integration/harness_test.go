@@ -51,12 +51,16 @@ var (
 	pgAdminBase = envOr("IT_PG_ADMIN_URL", "postgres://postgres:postgres@localhost:5432/wallet?sslmode=disable")
 	pgAppUser   = envOr("IT_PG_APP_USER", "wallet_app")
 	pgAppPass   = envOr("IT_PG_APP_PASSWORD", "wallet_app_local")
+	pgRelayUser = envOr("IT_PG_RELAY_USER", "wallet_relay")
+	pgRelayPass = envOr("IT_PG_RELAY_PASSWORD", "wallet_relay_local")
 	keycloakURL = envOr("KEYCLOAK_URL", "http://localhost:8180")
 	awsEndpoint = envOr("IT_AWS_ENDPOINT_URL", "http://localhost:4566")
 	oidcIssuer  = keycloakURL + "/realms/jungle"
 	testDBName  string
 	adminURL    string // owner connection to the test database
-	appURL      string // least-privileged runtime connection
+	appURL      string // least-privileged runtime connection (money movement)
+	relayURL    string // outbox relay connection (outbox delivery columns only)
+	relayPool   *pgxpool.Pool
 	binPath     string
 	adminPool   *pgxpool.Pool
 	sqsClient   *sqs.Client
@@ -78,17 +82,29 @@ func withUser(base, user, pass string) string {
 	return u.String()
 }
 
-// createDatabase creates an empty database accessible to the app role.
+// createDatabase creates an empty database accessible to the runtime roles.
+// The relay role is created when missing (e.g. a Postgres volume initialised
+// before the role existed), mirroring deploy/postgres/init.sql.
 func createDatabase(ctx context.Context, name string) error {
 	conn, err := pgx.Connect(ctx, pgAdminBase)
 	if err != nil {
 		return fmt.Errorf("connect admin (is `docker compose up -d postgres` running?): %w", err)
 	}
 	defer conn.Close(ctx)
+	var exists bool
+	if err := conn.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1)`, pgRelayUser).Scan(&exists); err != nil {
+		return err
+	}
+	if !exists {
+		if _, err := conn.Exec(ctx, fmt.Sprintf("CREATE ROLE %s LOGIN PASSWORD '%s'", pgx.Identifier{pgRelayUser}.Sanitize(), pgRelayPass)); err != nil {
+			return err
+		}
+	}
 	if _, err := conn.Exec(ctx, "CREATE DATABASE "+pgx.Identifier{name}.Sanitize()); err != nil {
 		return err
 	}
-	_, err = conn.Exec(ctx, fmt.Sprintf("GRANT CONNECT ON DATABASE %s TO %s", pgx.Identifier{name}.Sanitize(), pgAppUser))
+	_, err = conn.Exec(ctx, fmt.Sprintf("GRANT CONNECT ON DATABASE %s TO %s, %s", pgx.Identifier{name}.Sanitize(),
+		pgx.Identifier{pgAppUser}.Sanitize(), pgx.Identifier{pgRelayUser}.Sanitize()))
 	return err
 }
 
@@ -118,6 +134,7 @@ func run(m *testing.M) int {
 	}
 	adminURL = withDB(pgAdminBase, testDBName)
 	appURL = withUser(adminURL, pgAppUser, pgAppPass)
+	relayURL = withUser(adminURL, pgRelayUser, pgRelayPass)
 	if err := postgres.MigrateUp(adminURL); err != nil {
 		fmt.Fprintln(os.Stderr, "migrate:", err)
 		return 1
@@ -128,6 +145,11 @@ func run(m *testing.M) int {
 		return 1
 	}
 	defer adminPool.Close()
+	if relayPool, err = pgxpool.New(ctx, relayURL); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	defer relayPool.Close()
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion("us-east-1"),
 		awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("provider-gateway", "provider-gateway-local", "")))
 	if err != nil {
@@ -200,7 +222,7 @@ func baseConfig(q queueSet) config.Config {
 	return config.Config{
 		InstanceID: "it-" + uuid.NewString()[:8],
 		LogLevel:   envOr("IT_LOG_LEVEL", "error"),
-		HTTP: config.HTTP{Addr: "127.0.0.1:0", ReadTimeout: 10 * time.Second, WriteTimeout: 15 * time.Second,
+		HTTP: config.HTTP{APIEnabled: true, Addr: "127.0.0.1:0", ReadTimeout: 10 * time.Second, WriteTimeout: 15 * time.Second,
 			RequestTimeout: 10 * time.Second, ShutdownTimeout: 10 * time.Second},
 		Database: config.Database{URL: appURL, MaxConns: 30, ConnectTimeout: 3 * time.Second},
 		AWS:      config.AWS{Region: "us-east-1", EndpointURL: awsEndpoint},
@@ -209,7 +231,7 @@ func baseConfig(q queueSet) config.Config {
 			WaitTime: time.Second, VisibilityTimeout: 5 * time.Second, MaxReceives: 3, Concurrency: 4,
 			HandlerTimeout: 4 * time.Second, RetryBaseDelay: time.Second, RetryMaxDelay: 2 * time.Second,
 			AllowedProviders: []string{"provider-a", "provider-b"}},
-		Outbox: config.Outbox{Enabled: true, PollInterval: 100 * time.Millisecond, BatchSize: 50,
+		Outbox: config.Outbox{Enabled: true, DatabaseURL: relayURL, PollInterval: 100 * time.Millisecond, BatchSize: 50,
 			Lease: 5 * time.Second, BaseBackoff: 200 * time.Millisecond, MaxBackoff: 2 * time.Second},
 		Pending: config.Pending{Enabled: true, PollInterval: 100 * time.Millisecond, BatchSize: 50,
 			MaxAttempts: 12, BaseDelay: 200 * time.Millisecond, MaxDelay: time.Second, TTL: time.Minute},
@@ -231,6 +253,7 @@ func configEnv(c config.Config) []string {
 		"SQS_INGRESS_DLQ=" + c.SQS.IngressDLQ, "SQS_EVENTS_QUEUE=" + c.SQS.EventsQueue,
 		"SQS_WAIT_TIME=" + c.SQS.WaitTime.String(), "SQS_VISIBILITY_TIMEOUT=" + c.SQS.VisibilityTimeout.String(),
 		"SQS_HANDLER_TIMEOUT=" + c.SQS.HandlerTimeout.String(), "SQS_MAX_RECEIVES=" + fmt.Sprint(c.SQS.MaxReceives),
+		"API_ENABLED=" + b(c.HTTP.APIEnabled), "OUTBOX_DATABASE_URL=" + c.Outbox.DatabaseURL,
 		"OUTBOX_ENABLED=" + b(c.Outbox.Enabled), "OUTBOX_POLL_INTERVAL=" + c.Outbox.PollInterval.String(),
 		"OUTBOX_LEASE=" + c.Outbox.Lease.String(),
 		"PENDING_WORKER_ENABLED=" + b(c.Pending.Enabled), "PENDING_POLL_INTERVAL=" + c.Pending.PollInterval.String(),
@@ -254,13 +277,26 @@ type instance struct {
 	stopped  bool
 }
 
-// startApp runs the whole Fx application in-process (own pool and workers).
+// startApp runs the Fx application in-process with the components enabled in
+// cfg (own pools and workers). Fields of disabled components stay nil.
 func startApp(t *testing.T, cfg config.Config) *instance {
 	t.Helper()
 	inst := &instance{}
 	var srv *bootstrap.Server
-	app := fx.New(bootstrap.Options(cfg), fx.NopLogger,
-		fx.Populate(&srv, &inst.Metrics, &inst.Consumer, &inst.Outbox, &inst.Pending, &inst.Pool))
+	targets := []any{&srv, &inst.Metrics}
+	if cfg.NeedsAppDatabase() {
+		targets = append(targets, &inst.Pool)
+	}
+	if cfg.SQS.ConsumerEnabled {
+		targets = append(targets, &inst.Consumer)
+	}
+	if cfg.Outbox.Enabled {
+		targets = append(targets, &inst.Outbox)
+	}
+	if cfg.Pending.Enabled {
+		targets = append(targets, &inst.Pending)
+	}
+	app := fx.New(bootstrap.Options(cfg), fx.NopLogger, fx.Populate(targets...))
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if err := app.Start(ctx); err != nil {

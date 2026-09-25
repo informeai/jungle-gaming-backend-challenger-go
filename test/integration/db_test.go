@@ -39,6 +39,8 @@ func TestMigrationsUpDownUp(t *testing.T) {
 		want int
 	}{
 		{func() error { return postgres.MigrateUp(u) }, 5},
+		{func() error { return postgres.MigrateDown(u, 1) }, 5}, // reverts only 000002 (grants)
+		{func() error { return postgres.MigrateUp(u) }, 5},
 		{func() error { return postgres.MigrateDown(u, 0) }, 0},
 		{func() error { return postgres.MigrateUp(u) }, 5},
 	} {
@@ -49,7 +51,7 @@ func TestMigrationsUpDownUp(t *testing.T) {
 			t.Fatalf("step %d: %d tables, want %d", i, got, step.want)
 		}
 	}
-	if v, err := postgres.MigrationVersion(u); err != nil || !strings.HasPrefix(v, "1 ") {
+	if v, err := postgres.MigrationVersion(u); err != nil || !strings.HasPrefix(v, "2 ") {
 		t.Fatalf("version %q %v", v, err)
 	}
 }

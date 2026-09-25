@@ -266,7 +266,9 @@ func TestHTTPContract(t *testing.T) {
 	if r := do(t, http.MethodGet, inst.Base+"/health/live", "", nil, nil); r.Status != 200 {
 		t.Errorf("live %d", r.Status)
 	}
-	if r := do(t, http.MethodGet, inst.Base+"/health/ready", "", nil, nil); r.Status != 200 || r.str("dependencies", "postgres") != "UP" || r.str("dependencies", "sqs") != "UP" {
+	// Readiness covers the dependencies of the enabled components: postgres for
+	// the API, postgres-outbox and sqs-events for the relay.
+	if r := do(t, http.MethodGet, inst.Base+"/health/ready", "", nil, nil); r.Status != 200 || r.str("dependencies", "postgres") != "UP" || r.str("dependencies", "sqs-events") != "UP" {
 		t.Errorf("ready %d %s", r.Status, r.Raw)
 	}
 }

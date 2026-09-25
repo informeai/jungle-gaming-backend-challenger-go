@@ -1888,6 +1888,80 @@
           "sort": "desc"
         }
       }
+    },
+    {
+      "type": "state-timeline",
+      "id": 27,
+      "title": "Circuit breakers",
+      "description": "Estado de cada circuit breaker por instância (dependência @ instância). ABERTO: a dependência falhou repetidamente; a API responde 503 na hora e consumidores/relays ficam pausados até uma sonda passar (MEIO-ABERTO).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 59,
+        "w": 24,
+        "h": 11
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "label_replace(label_replace(label_replace(circuit_breaker_state{component=~\"$component\"}, \"who\", \"$1\", \"instance\", \"([^:]+):.*\"), \"who\", \"pending-$1\", \"who\", \"pending-worker-(.*)\"), \"who\", \"relay-$1\", \"who\", \"outbox-relay-(.*)\")",
+          "legendFormat": "{{name}} @ {{who}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "#0ca30c"
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "FECHADO",
+                  "color": "#0ca30c",
+                  "index": 0
+                },
+                "1": {
+                  "text": "MEIO-ABERTO",
+                  "color": "#fab219",
+                  "index": 1
+                },
+                "2": {
+                  "text": "ABERTO",
+                  "color": "#d03b3b",
+                  "index": 2
+                }
+              }
+            }
+          ],
+          "custom": {
+            "fillOpacity": 70,
+            "lineWidth": 0
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "showValue": "always",
+        "rowHeight": 0.8,
+        "mergeValues": true,
+        "alignValue": "center",
+        "legend": {
+          "showLegend": false
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      }
     }
   ]
 }

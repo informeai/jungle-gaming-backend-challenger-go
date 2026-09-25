@@ -49,3 +49,12 @@ groups:
         annotations:
           summary: "API returning 503 (dependency unavailable)"
           description: "PostgreSQL or a timeout is failing requests; clients should retry with the same Idempotency-Key."
+
+      - alert: CircuitBreakerOpen
+        # 0 closed, 1 half-open, 2 open (circuit_breaker_state).
+        expr: max by (name, component, instance) (circuit_breaker_state) == 2
+        for: 15s
+        labels: { severity: critical }
+        annotations:
+          summary: "Circuit breaker {{ $labels.name }} open on {{ $labels.instance }}"
+          description: "The dependency is failing: the API answers 503 immediately and consumers/relays are paused until a probe succeeds."

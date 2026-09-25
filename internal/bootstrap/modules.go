@@ -27,6 +27,7 @@ import (
 	"github.com/informeai/jungle-gaming-backend-challenger-go/internal/infra/postgres"
 	"github.com/informeai/jungle-gaming-backend-challenger-go/internal/infra/sqs"
 	"github.com/informeai/jungle-gaming-backend-challenger-go/internal/observability"
+	"github.com/informeai/jungle-gaming-backend-challenger-go/internal/resilience"
 	"github.com/informeai/jungle-gaming-backend-challenger-go/internal/worker"
 )
 
@@ -47,7 +48,12 @@ func readiness(f any) any {
 var PostgresModule = fx.Module("postgres",
 	fx.Provide(
 		newPool,
-		postgres.NewTxManager,
+		func(cfg config.Config, m *observability.Metrics, log *slog.Logger) AppDBBreaker {
+			return AppDBBreaker{postgres.NewBreaker("postgres", cfg.Breaker, m, log)}
+		},
+		func(pool *pgxpool.Pool, b AppDBBreaker) *postgres.TxManager {
+			return postgres.NewTxManager(pool, b.Breaker)
+		},
 		postgres.NewWalletRepo,
 		postgres.NewTransactionRepo,
 		postgres.NewOutboxRepo,
@@ -57,11 +63,35 @@ var PostgresModule = fx.Module("postgres",
 		func(r *postgres.TransactionRepo) app.TransactionRepository { return r },
 		func(r *postgres.OutboxRepo) app.OutboxRepository { return r },
 		func(r *postgres.InboxRepo) app.InboxRepository { return r },
-		readiness(func(pool *pgxpool.Pool) httpapi.ReadinessCheck {
-			return httpapi.ReadinessCheck{Name: "postgres", Check: func(ctx context.Context) error { return postgres.Ping(ctx, pool) }}
+		readiness(func(pool *pgxpool.Pool, b AppDBBreaker) httpapi.ReadinessCheck {
+			return httpapi.ReadinessCheck{Name: "postgres", Check: dbCheck(pool, b.Breaker)}
 		}),
 	),
 )
+
+// AppDBBreaker and SQSBreaker name the circuit breakers in the Fx graph.
+type AppDBBreaker struct{ *resilience.Breaker }
+type SQSBreaker struct{ *resilience.Breaker }
+
+// dbCheck reports DOWN while the breaker is open (the instance cannot serve
+// money operations) and otherwise pings the database directly.
+func dbCheck(pool *pgxpool.Pool, b *resilience.Breaker) func(ctx context.Context) error {
+	return func(ctx context.Context) error {
+		if b.State() == resilience.Open {
+			return resilience.ErrOpen
+		}
+		return postgres.Ping(ctx, pool)
+	}
+}
+
+func sqsCheck(client *awssqs.Client, b *resilience.Breaker, url func() string) func(ctx context.Context) error {
+	return func(ctx context.Context) error {
+		if b.State() == resilience.Open {
+			return resilience.ErrOpen
+		}
+		return sqs.Ping(ctx, client, url())
+	}
+}
 
 func newPool(lc fx.Lifecycle, cfg config.Config, log *slog.Logger) (*pgxpool.Pool, error) {
 	return openPool(lc, cfg.Database, "postgres", log)
@@ -98,11 +128,12 @@ var SQSModule = fx.Module("sqs",
 
 type sqsResult struct {
 	fx.Out
-	Client *awssqs.Client
-	Queues *sqs.Queues
+	Client  *awssqs.Client
+	Queues  *sqs.Queues
+	Breaker SQSBreaker
 }
 
-func newSQS(lc fx.Lifecycle, cfg config.Config, log *slog.Logger) (sqsResult, error) {
+func newSQS(lc fx.Lifecycle, cfg config.Config, m *observability.Metrics, log *slog.Logger) (sqsResult, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	client, err := sqs.NewClient(ctx, cfg.AWS)
@@ -119,7 +150,7 @@ func newSQS(lc fx.Lifecycle, cfg config.Config, log *slog.Logger) (sqsResult, er
 		log.Info("sqs queues resolved")
 		return nil
 	}})
-	return sqsResult{Client: client, Queues: queues}, nil
+	return sqsResult{Client: client, Queues: queues, Breaker: SQSBreaker{sqs.NewBreaker(cfg.Breaker, m, log)}}, nil
 }
 
 // AuthModule provides the OIDC token verifier.
@@ -171,20 +202,26 @@ func newWalletService(p serviceParams) *app.WalletService {
 type OutboxLoop struct{ *worker.Loop }
 type PendingLoop struct{ *worker.Loop }
 
-// RelayPool is the outbox relay's own pool, authenticated as wallet_relay.
-type RelayPool struct{ *pgxpool.Pool }
+// RelayPool is the outbox relay's own pool, authenticated as wallet_relay,
+// with its own circuit breaker.
+type RelayPool struct {
+	*pgxpool.Pool
+	Tx *postgres.TxManager
+}
 
 // ConsumerModule runs the SQS ingress consumer.
 var ConsumerModule = fx.Module("sqs-consumer",
-	fx.Provide(newConsumer, readiness(func(client *awssqs.Client, queues *sqs.Queues) httpapi.ReadinessCheck {
-		return httpapi.ReadinessCheck{Name: "sqs-ingress", Check: func(ctx context.Context) error { return sqs.Ping(ctx, client, queues.Ingress) }}
+	fx.Provide(newConsumer, readiness(func(client *awssqs.Client, queues *sqs.Queues, b SQSBreaker) httpapi.ReadinessCheck {
+		return httpapi.ReadinessCheck{Name: "sqs-ingress", Check: sqsCheck(client, b.Breaker, func() string { return queues.Ingress })}
 	})),
 	fx.Invoke(func(*sqs.Consumer) {}),
 )
 
-func newConsumer(lc fx.Lifecycle, cfg config.Config, client *awssqs.Client, queues *sqs.Queues,
-	svc *app.WageringService, m *observability.Metrics, log *slog.Logger) *sqs.Consumer {
+func newConsumer(lc fx.Lifecycle, cfg config.Config, client *awssqs.Client, queues *sqs.Queues, sqsBreaker SQSBreaker,
+	tx *postgres.TxManager, svc *app.WageringService, m *observability.Metrics, log *slog.Logger) *sqs.Consumer {
 	c := sqs.NewConsumer(client, queues, svc, cfg.SQS, m, log)
+	c.Breaker = sqsBreaker.Breaker
+	c.Gates = []*resilience.Gate{tx.Gate(), sqs.NewGate(sqsBreaker.Breaker, client, func() string { return queues.Ingress })}
 	if cfg.FaultInjection == "consumer-crash-after-commit" {
 		c.AfterCommit = func(id string) {
 			log.Error("FAULT INJECTION: crashing after commit, before deleting the message", slog.String("messageId", id))
@@ -206,36 +243,45 @@ func newConsumer(lc fx.Lifecycle, cfg config.Config, client *awssqs.Client, queu
 // never holds the credentials that move money.
 var OutboxModule = fx.Module("outbox-relay",
 	fx.Provide(
-		func(lc fx.Lifecycle, cfg config.Config, log *slog.Logger) (RelayPool, error) {
+		func(lc fx.Lifecycle, cfg config.Config, m *observability.Metrics, log *slog.Logger) (RelayPool, error) {
 			db := cfg.Database
 			db.URL = cfg.Outbox.DatabaseURL
 			db.MaxConns = 4
 			pool, err := openPool(lc, db, "outbox-relay", log)
-			return RelayPool{pool}, err
+			if err != nil {
+				return RelayPool{}, err
+			}
+			return RelayPool{Pool: pool, Tx: postgres.NewTxManager(pool, postgres.NewBreaker("postgres-outbox", cfg.Breaker, m, log))}, nil
 		},
 		newOutboxRelay,
 		readiness(func(pool RelayPool) httpapi.ReadinessCheck {
-			return httpapi.ReadinessCheck{Name: "postgres-outbox", Check: func(ctx context.Context) error { return postgres.Ping(ctx, pool.Pool) }}
+			return httpapi.ReadinessCheck{Name: "postgres-outbox", Check: dbCheck(pool.Pool, pool.Tx.Breaker())}
 		}),
-		readiness(func(client *awssqs.Client, queues *sqs.Queues) httpapi.ReadinessCheck {
-			return httpapi.ReadinessCheck{Name: "sqs-events", Check: func(ctx context.Context) error { return sqs.Ping(ctx, client, queues.Events) }}
+		readiness(func(client *awssqs.Client, queues *sqs.Queues, b SQSBreaker) httpapi.ReadinessCheck {
+			return httpapi.ReadinessCheck{Name: "sqs-events", Check: sqsCheck(client, b.Breaker, func() string { return queues.Events })}
 		}),
 	),
 	fx.Invoke(func(*OutboxLoop) {}),
 )
 
-func newOutboxRelay(lc fx.Lifecycle, cfg config.Config, client *awssqs.Client, queues *sqs.Queues,
+func newOutboxRelay(lc fx.Lifecycle, cfg config.Config, client *awssqs.Client, queues *sqs.Queues, sqsBreaker SQSBreaker,
 	pool RelayPool, m *observability.Metrics, log *slog.Logger) *OutboxLoop {
-	repo := postgres.NewOutboxRepo(postgres.NewTxManager(pool.Pool))
+	repo := postgres.NewOutboxRepo(pool.Tx)
 	var relay *worker.OutboxRelay
 	loop := worker.NewLoop("outbox-relay", cfg.Outbox.PollInterval, log, func(ctx context.Context) {
 		// Drain quickly while there is backlog.
 		for relay.Tick(ctx) == cfg.Outbox.BatchSize && ctx.Err() == nil {
 		}
 	})
+	// Bounds claims on an unresponsive database; unfinished leases of a
+	// timed-out tick are handed back by Tick itself.
+	loop.TickTimeout = 30 * time.Second
 	lc.Append(fx.Hook{
 		OnStart: func(context.Context) error {
-			relay = worker.NewOutboxRelay(repo, sqs.NewEventPublisher(client, *queues), cfg.InstanceID+"/"+uuid.NewString(), cfg.Outbox, m, log)
+			pub := sqs.NewEventPublisher(client, *queues)
+			pub.Breaker = sqsBreaker.Breaker
+			relay = worker.NewOutboxRelay(repo, pub, cfg.InstanceID+"/"+uuid.NewString(), cfg.Outbox, m, log)
+			relay.Gates = []*resilience.Gate{pool.Tx.Gate(), sqs.NewGate(sqsBreaker.Breaker, client, func() string { return queues.Events })}
 			if cfg.FaultInjection == "outbox-crash-after-publish" {
 				relay.AfterPublish = func(id uuid.UUID) {
 					log.Error("FAULT INJECTION: crashing after publish, before confirming the outbox row", slog.String("eventId", id.String()))
@@ -256,9 +302,11 @@ var PendingModule = fx.Module("pending-reference-worker",
 	fx.Invoke(func(*PendingLoop) {}),
 )
 
-func newPendingLoop(lc fx.Lifecycle, cfg config.Config, svc *app.WageringService, log *slog.Logger) *PendingLoop {
+func newPendingLoop(lc fx.Lifecycle, cfg config.Config, tx *postgres.TxManager, svc *app.WageringService, log *slog.Logger) *PendingLoop {
 	resolver := worker.NewPendingResolver(svc, cfg.Pending.BatchSize, log)
+	resolver.Gate = tx.Gate()
 	loop := worker.NewLoop("pending-reference-worker", cfg.Pending.PollInterval, log, resolver.Tick)
+	loop.TickTimeout = 10 * time.Second
 	lc.Append(fx.Hook{OnStart: func(context.Context) error { loop.Start(); return nil }, OnStop: loop.Stop})
 	return &PendingLoop{loop}
 }

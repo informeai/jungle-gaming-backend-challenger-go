@@ -60,14 +60,17 @@ func NewWageringService(d WageringDeps) *WageringService {
 }
 
 // maxTxAttempts bounds retries of a whole database transaction after a
-// transient conflict (serialization failure, deadlock, version mismatch).
+// concurrency conflict (serialization failure, deadlock, version mismatch).
+// Unavailability (connection errors, open breaker) is not retried here: the
+// caller gets a fast transient error and the circuit breaker protects the
+// database from retry storms.
 const maxTxAttempts = 3
 
 func (s *WageringService) retry(ctx context.Context, fn func(ctx context.Context) error) error {
 	var err error
 	for attempt := 1; attempt <= maxTxAttempts; attempt++ {
 		err = s.tx.WithinTx(ctx, fn)
-		if err == nil || !(IsTransient(err) || errors.Is(err, ErrConcurrentUpdate)) || ctx.Err() != nil {
+		if err == nil || !IsRetryableConflict(err) || ctx.Err() != nil {
 			return err
 		}
 		s.metrics.ConcurrencyConflict()

@@ -6,6 +6,7 @@ import (
 	"log/slog"
 
 	"github.com/informeai/jungle-gaming-backend-challenger-go/internal/app"
+	"github.com/informeai/jungle-gaming-backend-challenger-go/internal/resilience"
 )
 
 // PendingResolver retries PENDING_REFERENCE operations. State lives only in
@@ -15,6 +16,8 @@ type PendingResolver struct {
 	svc   *app.WageringService
 	batch int
 	log   *slog.Logger
+	// Gate pauses the worker while the database breaker is open.
+	Gate *resilience.Gate
 }
 
 func NewPendingResolver(svc *app.WageringService, batch int, log *slog.Logger) *PendingResolver {
@@ -23,6 +26,9 @@ func NewPendingResolver(svc *app.WageringService, batch int, log *slog.Logger) *
 
 // Tick evaluates every due pending operation once.
 func (p *PendingResolver) Tick(ctx context.Context) {
+	if err := p.Gate.Ready(ctx); err != nil {
+		return // stopping
+	}
 	due, err := p.svc.DuePending(ctx, p.batch)
 	if err != nil {
 		if ctx.Err() == nil {
@@ -35,6 +41,9 @@ func (p *PendingResolver) Tick(ctx context.Context) {
 			return
 		}
 		_, err := p.svc.ResolvePending(ctx, d)
+		if errors.Is(err, resilience.ErrOpen) {
+			return // database unavailable: stop this tick, the gate waits
+		}
 		if err == nil || ctx.Err() != nil || app.IsTransient(err) || errors.Is(err, context.DeadlineExceeded) {
 			if err != nil && ctx.Err() == nil {
 				p.log.Warn("pending reference attempt failed (transient)", slog.String("transactionId", d.TransactionID.String()), slog.String("error", err.Error()))

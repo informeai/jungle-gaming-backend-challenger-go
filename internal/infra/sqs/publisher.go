@@ -8,6 +8,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
 
 	"github.com/informeai/jungle-gaming-backend-challenger-go/internal/infra/postgres"
+	"github.com/informeai/jungle-gaming-backend-challenger-go/internal/resilience"
 )
 
 // EventPublisher sends outbox events to the wallet-events FIFO queue.
@@ -21,6 +22,8 @@ import (
 type EventPublisher struct {
 	client   *sqs.Client
 	queueURL string
+	// Breaker guards SendMessage; nil disables it.
+	Breaker *resilience.Breaker
 }
 
 func NewEventPublisher(client *sqs.Client, queues Queues) *EventPublisher {
@@ -28,6 +31,10 @@ func NewEventPublisher(client *sqs.Client, queues Queues) *EventPublisher {
 }
 
 func (p *EventPublisher) Publish(ctx context.Context, m postgres.OutboxMessage) error {
+	return p.Breaker.Do(func() error { return p.send(ctx, m) })
+}
+
+func (p *EventPublisher) send(ctx context.Context, m postgres.OutboxMessage) error {
 	_, err := p.client.SendMessage(ctx, &sqs.SendMessageInput{
 		QueueUrl:               aws.String(p.queueURL),
 		MessageBody:            aws.String(string(m.Payload)),

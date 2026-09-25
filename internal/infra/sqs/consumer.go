@@ -16,6 +16,7 @@ import (
 	"github.com/informeai/jungle-gaming-backend-challenger-go/internal/app"
 	"github.com/informeai/jungle-gaming-backend-challenger-go/internal/config"
 	"github.com/informeai/jungle-gaming-backend-challenger-go/internal/contract"
+	"github.com/informeai/jungle-gaming-backend-challenger-go/internal/resilience"
 )
 
 // ConsumerMetrics is the instrumentation used by the consumer.
@@ -39,6 +40,13 @@ type Consumer struct {
 	// AfterCommit, when set, runs after the durable commit and before the
 	// message is deleted. Fault-injection hook for crash tests.
 	AfterCommit func(messageID string)
+
+	// Gates pause polling while a dependency's circuit breaker is open
+	// (PostgreSQL, SQS): messages stay in the queue instead of being received
+	// only to fail, so an outage does not spend their receive count.
+	Gates []*resilience.Gate
+	// Breaker guards ReceiveMessage against an unavailable broker.
+	Breaker *resilience.Breaker
 
 	cancelPoll context.CancelFunc
 	cancelWork context.CancelFunc
@@ -91,16 +99,31 @@ func (c *Consumer) loop(pollCtx, workCtx context.Context) {
 	sem := make(chan struct{}, c.cfg.Concurrency)
 	backoff := 200 * time.Millisecond
 	for pollCtx.Err() == nil {
-		out, err := c.client.ReceiveMessage(pollCtx, &sqs.ReceiveMessageInput{
-			QueueUrl:            aws.String(c.queues.Ingress),
-			MaxNumberOfMessages: c.cfg.MaxMessages,
-			WaitTimeSeconds:     int32(c.cfg.WaitTime / time.Second),
-			VisibilityTimeout:   int32(c.cfg.VisibilityTimeout / time.Second),
-			MessageSystemAttributeNames: []types.MessageSystemAttributeName{
-				types.MessageSystemAttributeNameApproximateReceiveCount,
-				types.MessageSystemAttributeNameMessageGroupId,
-			},
+		if !c.waitGates(pollCtx) {
+			return
+		}
+		var out *sqs.ReceiveMessageOutput
+		err := c.Breaker.Do(func() error {
+			// Long polling waits up to WaitTime; a broker that accepts the
+			// connection but never answers must still surface as a failure.
+			rctx, cancel := context.WithTimeout(pollCtx, c.cfg.WaitTime+10*time.Second)
+			defer cancel()
+			var err error
+			out, err = c.client.ReceiveMessage(rctx, &sqs.ReceiveMessageInput{
+				QueueUrl:            aws.String(c.queues.Ingress),
+				MaxNumberOfMessages: c.cfg.MaxMessages,
+				WaitTimeSeconds:     int32(c.cfg.WaitTime / time.Second),
+				VisibilityTimeout:   int32(c.cfg.VisibilityTimeout / time.Second),
+				MessageSystemAttributeNames: []types.MessageSystemAttributeName{
+					types.MessageSystemAttributeNameApproximateReceiveCount,
+					types.MessageSystemAttributeNameMessageGroupId,
+				},
+			})
+			return err
 		})
+		if errors.Is(err, resilience.ErrOpen) {
+			continue // waitGates blocks until the broker is back
+		}
 		if err != nil {
 			if pollCtx.Err() != nil {
 				return
@@ -152,6 +175,40 @@ func (c *Consumer) loop(pollCtx, workCtx context.Context) {
 			}()
 		}
 	}
+}
+
+// dependencyOutage reports whether a dependency breaker is not closed: the
+// failure belongs to the dependency, not to the message, so the DLQ threshold
+// must not apply (the gates pause polling until it recovers). When every
+// dependency is healthy and one message keeps failing, the threshold applies.
+func (c *Consumer) dependencyOutage() bool {
+	for _, g := range c.Gates {
+		if !g.Healthy() {
+			return true
+		}
+	}
+	return false
+}
+
+// waitGates blocks while any dependency breaker is open. It reports false
+// when the consumer is stopping.
+func (c *Consumer) waitGates(ctx context.Context) bool {
+	var paused []string
+	for _, g := range c.Gates {
+		if !g.Healthy() {
+			paused = append(paused, g.Name())
+		}
+	}
+	if len(paused) > 0 {
+		c.log.Warn("consumer paused: dependency unavailable, messages stay in the queue", slog.Any("dependencies", paused))
+	}
+	if err := resilience.WaitAll(ctx, c.Gates...); err != nil {
+		return false
+	}
+	if len(paused) > 0 {
+		c.log.Info("consumer resumed", slog.Any("dependencies", paused))
+	}
+	return true
 }
 
 func (c *Consumer) track(m types.Message) {
@@ -305,9 +362,18 @@ func (c *Consumer) handle(workCtx context.Context, m types.Message) bool {
 		// Shutting down: nothing was committed; hand it back immediately.
 		c.release(m)
 		return false
+	case errors.Is(err, resilience.ErrOpen):
+		// The database breaker opened while this message was in flight. It is
+		// not the message's fault: hand it back without applying the DLQ
+		// threshold; the gates pause polling until the dependency recovers.
+		c.metrics.SQSRetry()
+		log.Warn("dependency circuit open; message returned to the queue", slog.String("error", err.Error()))
+		c.changeVisibility(m, c.cfg.RetryBaseDelay)
+		c.untrack(m)
+		return false
 	default:
 		n := receiveCount(m)
-		if n >= c.cfg.MaxReceives {
+		if n >= c.cfg.MaxReceives && !c.dependencyOutage() {
 			c.metrics.SQSMessage("failed")
 			return c.deadLetter(m, "retries_exhausted", log.With(slog.String("error", err.Error())))
 		}

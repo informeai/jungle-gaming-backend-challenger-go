@@ -17,6 +17,9 @@ type Loop struct {
 	interval time.Duration
 	tick     func(ctx context.Context)
 	log      *slog.Logger
+	// TickTimeout bounds each tick (0 = unbounded). Without it a tick blocked
+	// on an unresponsive dependency never fails, so no breaker would open.
+	TickTimeout time.Duration
 
 	cancel  context.CancelFunc
 	done    chan struct{}
@@ -37,7 +40,7 @@ func (l *Loop) Start() {
 		t := time.NewTicker(l.interval)
 		defer t.Stop()
 		for {
-			l.tick(ctx)
+			l.runTick(ctx)
 			select {
 			case <-ctx.Done():
 				return
@@ -46,6 +49,16 @@ func (l *Loop) Start() {
 		}
 	}()
 	l.log.Info("worker started")
+}
+
+func (l *Loop) runTick(ctx context.Context) {
+	if l.TickTimeout <= 0 {
+		l.tick(ctx)
+		return
+	}
+	tctx, cancel := context.WithTimeout(ctx, l.TickTimeout)
+	defer cancel()
+	l.tick(tctx)
 }
 
 func (l *Loop) Stop(ctx context.Context) error {

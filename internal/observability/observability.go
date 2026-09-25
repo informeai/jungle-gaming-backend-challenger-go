@@ -51,6 +51,8 @@ type Metrics struct {
 	outboxLag            prometheus.Gauge
 	outboxDelay          prometheus.Histogram
 	httpRequests         *prometheus.CounterVec
+	breakerState         *prometheus.GaugeVec
+	breakerRejections    *prometheus.CounterVec
 }
 
 func NewMetrics() *Metrics {
@@ -109,12 +111,19 @@ func NewMetrics() *Metrics {
 		httpRequests: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "http_requests_total", Help: "HTTP requests by route and status code.",
 		}, []string{"route", "code"}),
+		breakerState: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "circuit_breaker_state", Help: "Circuit breaker state per dependency: 0 closed, 1 half-open, 2 open.",
+		}, []string{"name"}),
+		breakerRejections: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "circuit_breaker_rejections_total", Help: "Calls rejected without touching the dependency because its breaker was open.",
+		}, []string{"name"}),
 	}
 	m.Registry.MustRegister(
 		collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 		m.transactions, m.duplicates, m.idempotencyConflicts, m.concurrencyConflicts, m.latency,
 		m.referenceRetries, m.reconciliations, m.reconDivergences, m.sqsMessages, m.sqsRetries, m.sqsDLQ,
 		m.outboxPublished, m.outboxFailures, m.outboxPending, m.outboxLag, m.outboxDelay, m.httpRequests,
+		m.breakerState, m.breakerRejections,
 	)
 	return m
 }
@@ -150,3 +159,11 @@ func (m *Metrics) OutboxBacklog(pending int64, lag time.Duration) {
 func (m *Metrics) HTTPRequest(route string, code int) {
 	m.httpRequests.WithLabelValues(route, strconv.Itoa(code)).Inc()
 }
+
+// BreakerState implements resilience.Observer.
+func (m *Metrics) BreakerState(name string, state int) {
+	m.breakerState.WithLabelValues(name).Set(float64(state))
+}
+
+// BreakerRejected implements resilience.Observer.
+func (m *Metrics) BreakerRejected(name string) { m.breakerRejections.WithLabelValues(name).Inc() }

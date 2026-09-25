@@ -25,6 +25,7 @@ type Config struct {
 	Outbox   Outbox
 	Pending  Pending
 	OIDC     OIDC
+	Breaker  Breaker
 }
 
 type HTTP struct {
@@ -87,6 +88,14 @@ type Pending struct {
 	BaseDelay    time.Duration
 	MaxDelay     time.Duration
 	TTL          time.Duration
+}
+
+// Breaker configures the circuit breakers of PostgreSQL and SQS.
+type Breaker struct {
+	// FailureThreshold consecutive unavailability errors open the breaker.
+	FailureThreshold uint32
+	// OpenTimeout: how long it stays open before a single probe.
+	OpenTimeout time.Duration
 }
 
 type OIDC struct {
@@ -159,6 +168,10 @@ func Load() (Config, error) {
 			MaxDelay:     e.dur("REFERENCE_MAX_DELAY", time.Minute),
 			TTL:          e.dur("REFERENCE_TTL", 30*time.Minute),
 		},
+		Breaker: Breaker{
+			FailureThreshold: uint32(e.int("BREAKER_FAILURE_THRESHOLD", 5)),
+			OpenTimeout:      e.dur("BREAKER_OPEN_TIMEOUT", 5*time.Second),
+		},
 		OIDC: OIDC{
 			Issuer:        e.str("OIDC_ISSUER", ""),
 			JWKSURL:       e.str("OIDC_JWKS_URL", ""),
@@ -219,6 +232,9 @@ func (c Config) Validate() error {
 	}
 	if c.Outbox.Lease <= 0 || c.Outbox.PollInterval <= 0 {
 		errs = append(errs, errors.New("outbox lease and poll interval must be positive"))
+	}
+	if c.Breaker.FailureThreshold < 1 || c.Breaker.OpenTimeout <= 0 {
+		errs = append(errs, errors.New("BREAKER_FAILURE_THRESHOLD and BREAKER_OPEN_TIMEOUT must be positive"))
 	}
 	if c.Database.MaxConns < 2 {
 		errs = append(errs, errors.New("DATABASE_MAX_CONNS must be >= 2"))

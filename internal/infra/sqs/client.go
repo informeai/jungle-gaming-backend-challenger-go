@@ -4,14 +4,18 @@ package sqs
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log/slog"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
 
 	"github.com/informeai/jungle-gaming-backend-challenger-go/internal/config"
+	"github.com/informeai/jungle-gaming-backend-challenger-go/internal/resilience"
 )
 
 // NewClient builds an SQS client. Credentials come from the standard AWS
@@ -69,4 +73,40 @@ func Ping(ctx context.Context, c *sqs.Client, queueURL string) error {
 		AttributeNames: []types.QueueAttributeName{types.QueueAttributeNameApproximateNumberOfMessages},
 	})
 	return err
+}
+
+// IsUnavailable is the SQS breaker's failure predicate: network errors,
+// timeouts and 5xx responses count; 4xx responses (bad request, missing
+// queue, access denied) mean the broker answered and do not. The SDK wraps
+// timeouts and connection failures in a ResponseError with status 0 (no
+// response at all), which counts as unavailable.
+func IsUnavailable(err error) bool {
+	if err == nil {
+		return false
+	}
+	var re *awshttp.ResponseError
+	if errors.As(err, &re) {
+		if re.ResponseError == nil || re.Response == nil || re.Response.Response == nil {
+			return true // no response at all
+		}
+		code := re.Response.StatusCode
+		return code == 0 || code >= 500
+	}
+	return !errors.Is(err, context.Canceled)
+}
+
+// NewBreaker builds the SQS circuit breaker.
+func NewBreaker(cfg config.Breaker, obs resilience.Observer, log *slog.Logger) *resilience.Breaker {
+	return resilience.New("sqs", resilience.Settings{
+		FailureThreshold: cfg.FailureThreshold, OpenTimeout: cfg.OpenTimeout, IsFailure: IsUnavailable,
+	}, obs, log)
+}
+
+// NewGate pauses background work while the SQS breaker is open; the
+// half-open probe is a cheap GetQueueAttributes on queueURL.
+func NewGate(b *resilience.Breaker, c *sqs.Client, queueURL func() string) *resilience.Gate {
+	if b == nil {
+		return nil
+	}
+	return resilience.NewGate(b, func(ctx context.Context) error { return Ping(ctx, c, queueURL()) })
 }

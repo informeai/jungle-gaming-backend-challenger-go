@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"time"
 
@@ -9,6 +10,7 @@ import (
 
 	"github.com/informeai/jungle-gaming-backend-challenger-go/internal/config"
 	"github.com/informeai/jungle-gaming-backend-challenger-go/internal/infra/postgres"
+	"github.com/informeai/jungle-gaming-backend-challenger-go/internal/resilience"
 )
 
 // OutboxStore is the persistence used by the publisher.
@@ -45,6 +47,10 @@ type OutboxRelay struct {
 	// before the outbox row is confirmed. Fault-injection hook.
 	AfterPublish func(eventID uuid.UUID)
 
+	// Gates pause claiming while the relay's database or SQS breaker is open,
+	// so events are not leased (and their attempts spent) only to fail.
+	Gates []*resilience.Gate
+
 	lastLag time.Time
 }
 
@@ -63,6 +69,9 @@ func (r *OutboxRelay) Backoff(attempt int) time.Duration {
 
 // Tick claims and publishes one batch. It returns the number published.
 func (r *OutboxRelay) Tick(ctx context.Context) int {
+	if err := resilience.WaitAll(ctx, r.Gates...); err != nil {
+		return 0 // stopping
+	}
 	r.reportLag(ctx)
 	msgs, err := r.store.Claim(ctx, r.owner, r.cfg.Lease, r.cfg.BatchSize)
 	if err != nil {
@@ -83,12 +92,19 @@ func (r *OutboxRelay) Tick(ctx context.Context) int {
 		pctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		err := r.pub.Publish(pctx, m)
 		cancel()
+		if errors.Is(err, resilience.ErrOpen) {
+			// Broker breaker opened mid-batch: hand this and the remaining
+			// leases back; the gate pauses the relay until SQS recovers.
+			log.Warn("sqs circuit open; releasing claimed events")
+			r.release(msgs[i:])
+			return published
+		}
 		if err != nil {
 			r.metrics.OutboxFailure()
 			next := time.Now().Add(r.Backoff(m.Attempts))
 			log.Warn("publish failed; will retry", slog.String("error", err.Error()),
 				slog.Int("attempts", m.Attempts), slog.Time("nextAttemptAt", next))
-			if err := r.store.MarkFailed(context.WithoutCancel(ctx), m.ID, r.owner, next, err.Error()); err != nil {
+			if err := r.markFailed(ctx, m.ID, next, err.Error()); err != nil {
 				log.Warn("could not reschedule; lease expiry will release it", slog.String("error", err.Error()))
 			}
 			continue
@@ -96,7 +112,9 @@ func (r *OutboxRelay) Tick(ctx context.Context) int {
 		if r.AfterPublish != nil {
 			r.AfterPublish(m.ID)
 		}
-		ok, err := r.store.MarkPublished(context.WithoutCancel(ctx), m.ID, r.owner)
+		sctx, cancel := storeContext(ctx)
+		ok, err := r.store.MarkPublished(sctx, m.ID, r.owner)
+		cancel()
 		if err != nil || !ok {
 			// The event was sent but not confirmed: it will be republished with
 			// the same eventId after the lease expires (at-least-once).
@@ -110,9 +128,22 @@ func (r *OutboxRelay) Tick(ctx context.Context) int {
 	return published
 }
 
+// storeContext bounds outbox bookkeeping: it survives the loop's cancellation
+// (a publication must still be confirmed during shutdown) but never waits
+// forever on an unresponsive database, so the breaker can see the failure.
+func storeContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+}
+
+func (r *OutboxRelay) markFailed(ctx context.Context, id uuid.UUID, next time.Time, cause string) error {
+	sctx, cancel := storeContext(ctx)
+	defer cancel()
+	return r.store.MarkFailed(sctx, id, r.owner, next, cause)
+}
+
 func (r *OutboxRelay) release(msgs []postgres.OutboxMessage) {
 	for _, m := range msgs {
-		_ = r.store.MarkFailed(context.Background(), m.ID, r.owner, time.Now(), "released on shutdown")
+		_ = r.markFailed(context.Background(), m.ID, time.Now(), "released")
 	}
 }
 

@@ -5,10 +5,12 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strconv"
 
 	"github.com/informeai/jungle-gaming-backend-challenger-go/internal/app"
 	"github.com/informeai/jungle-gaming-backend-challenger-go/internal/contract"
 	"github.com/informeai/jungle-gaming-backend-challenger-go/internal/domain/wagering"
+	"github.com/informeai/jungle-gaming-backend-challenger-go/internal/resilience"
 )
 
 // ErrorBody is the body of every non-2xx response that is not a persisted
@@ -55,6 +57,10 @@ func (a *API) writeAppError(w http.ResponseWriter, r *http.Request, err error) {
 		writeError(w, r, http.StatusConflict, "IDEMPOTENCY_KEY_CONFLICT", err.Error(), "Idempotency-Key")
 	case errors.Is(err, app.ErrExternalIDConflict):
 		writeError(w, r, http.StatusConflict, "EXTERNAL_TRANSACTION_CONFLICT", err.Error(), "externalTransactionId")
+	case errors.Is(err, resilience.ErrOpen):
+		// Circuit open: answered without touching the dependency.
+		w.Header().Set("Retry-After", strconv.Itoa(max(1, resilience.RetryAfterSeconds(err))))
+		writeError(w, r, http.StatusServiceUnavailable, "SERVICE_UNAVAILABLE", "dependency unavailable (circuit open), retry with the same Idempotency-Key", "")
 	case app.IsTransient(err), errors.Is(err, app.ErrConcurrentUpdate):
 		w.Header().Set("Retry-After", "1")
 		writeError(w, r, http.StatusServiceUnavailable, "SERVICE_UNAVAILABLE", "temporarily unavailable, retry with the same Idempotency-Key", "")

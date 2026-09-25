@@ -49,7 +49,8 @@ func NewAPI(wallets *app.WalletService, wagering *app.WageringService, verifier 
 // Drain makes readiness fail so load balancers stop routing new requests.
 func (a *API) Drain() { a.draining.Store(true) }
 
-// Handler builds the router.
+// Handler builds the router. Health and metrics are always served; business
+// routes only when the API component is enabled (a verifier was provided).
 func (a *API) Handler() http.Handler {
 	mux := http.NewServeMux()
 	route := func(pattern string, h http.HandlerFunc) {
@@ -58,6 +59,10 @@ func (a *API) Handler() http.Handler {
 	route("GET /health/live", a.live)
 	route("GET /health/ready", a.ready)
 	mux.Handle("GET /metrics", promhttp.HandlerFor(a.metrics.Registry, promhttp.HandlerOpts{}))
+	if a.verifier == nil {
+		// Worker-only component: no business routes and no token handling.
+		return mux
+	}
 
 	route("POST /wallets", a.internalOnly(a.openWallet))
 	route("GET /wallets/{walletId}", a.internalOnly(a.getWallet))

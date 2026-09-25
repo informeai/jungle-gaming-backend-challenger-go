@@ -28,6 +28,9 @@ type Config struct {
 }
 
 type HTTP struct {
+	// APIEnabled serves the business routes. When false the process only
+	// exposes /health/* and /metrics (worker-only components).
+	APIEnabled      bool
 	Addr            string
 	ReadTimeout     time.Duration
 	WriteTimeout    time.Duration
@@ -65,7 +68,10 @@ type SQS struct {
 }
 
 type Outbox struct {
-	Enabled      bool
+	Enabled bool
+	// DatabaseURL is the relay's own connection (role wallet_relay, which can
+	// only read outbox_events and update its delivery columns).
+	DatabaseURL  string
 	PollInterval time.Duration
 	BatchSize    int
 	Lease        time.Duration
@@ -102,6 +108,7 @@ func Load() (Config, error) {
 
 		FaultInjection: e.str("FAULT_INJECTION", ""),
 		HTTP: HTTP{
+			APIEnabled:      e.bool("API_ENABLED", true),
 			Addr:            e.str("HTTP_ADDR", ":8080"),
 			ReadTimeout:     e.dur("HTTP_READ_TIMEOUT", 10*time.Second),
 			WriteTimeout:    e.dur("HTTP_WRITE_TIMEOUT", 15*time.Second),
@@ -136,6 +143,7 @@ func Load() (Config, error) {
 		},
 		Outbox: Outbox{
 			Enabled:      e.bool("OUTBOX_ENABLED", true),
+			DatabaseURL:  e.str("OUTBOX_DATABASE_URL", ""),
 			PollInterval: e.dur("OUTBOX_POLL_INTERVAL", 500*time.Millisecond),
 			BatchSize:    e.int("OUTBOX_BATCH_SIZE", 50),
 			Lease:        e.dur("OUTBOX_LEASE", 30*time.Second),
@@ -174,11 +182,25 @@ func (c Config) Validate() error {
 			errs = append(errs, fmt.Errorf("%s is required", name))
 		}
 	}
-	req("DATABASE_URL", c.Database.URL)
-	req("OIDC_ISSUER", c.OIDC.Issuer)
-	req("OIDC_AUDIENCE", c.OIDC.Audience)
-	req("SQS_INGRESS_QUEUE", c.SQS.IngressQueue)
-	req("SQS_EVENTS_QUEUE", c.SQS.EventsQueue)
+	// Each component only requires the settings (and credentials) it uses.
+	if c.NeedsAppDatabase() {
+		req("DATABASE_URL", c.Database.URL)
+	}
+	if c.HTTP.APIEnabled {
+		req("OIDC_ISSUER", c.OIDC.Issuer)
+		req("OIDC_AUDIENCE", c.OIDC.Audience)
+	}
+	if c.SQS.ConsumerEnabled {
+		req("SQS_INGRESS_QUEUE", c.SQS.IngressQueue)
+		req("SQS_INGRESS_DLQ", c.SQS.IngressDLQ)
+	}
+	if c.Outbox.Enabled {
+		req("SQS_EVENTS_QUEUE", c.SQS.EventsQueue)
+		req("OUTBOX_DATABASE_URL", c.Outbox.DatabaseURL)
+	}
+	if !c.HTTP.APIEnabled && !c.SQS.ConsumerEnabled && !c.Outbox.Enabled && !c.Pending.Enabled {
+		errs = append(errs, errors.New("at least one component must be enabled (API, SQS consumer, outbox relay or pending worker)"))
+	}
 	req("INSTANCE_ID", c.InstanceID)
 	if c.SQS.MaxMessages < 1 || c.SQS.MaxMessages > 10 {
 		errs = append(errs, errors.New("SQS_MAX_MESSAGES must be between 1 and 10"))
@@ -203,6 +225,16 @@ func (c Config) Validate() error {
 	}
 	return errors.Join(errs...)
 }
+
+// NeedsAppDatabase reports whether the process moves money (API, consumer or
+// pending worker) and therefore needs the wallet_app connection. A relay-only
+// process never receives those credentials.
+func (c Config) NeedsAppDatabase() bool {
+	return c.HTTP.APIEnabled || c.SQS.ConsumerEnabled || c.Pending.Enabled
+}
+
+// NeedsSQS reports whether the process talks to the broker.
+func (c Config) NeedsSQS() bool { return c.SQS.ConsumerEnabled || c.Outbox.Enabled }
 
 type env struct{ errs []error }
 

@@ -35,23 +35,34 @@ type Queues struct {
 	Events  string
 }
 
-// ResolveQueues looks up every queue URL, failing fast when one is missing.
-func ResolveQueues(ctx context.Context, c *sqs.Client, cfg config.SQS) (Queues, error) {
+// ResolveQueues looks up the URLs of the queues a component uses, failing
+// fast when one is missing: the consumer needs ingress + DLQ, the outbox relay
+// only the events queue. Unused queues are never touched, so each component
+// can run with credentials limited to its own queues.
+func ResolveQueues(ctx context.Context, c *sqs.Client, cfg config.SQS, consumer, relay bool) (Queues, error) {
 	var q Queues
-	for _, item := range []struct {
+	type item struct {
 		name string
 		dst  *string
-	}{{cfg.IngressQueue, &q.Ingress}, {cfg.IngressDLQ, &q.DLQ}, {cfg.EventsQueue, &q.Events}} {
-		out, err := c.GetQueueUrl(ctx, &sqs.GetQueueUrlInput{QueueName: aws.String(item.name)})
+	}
+	var items []item
+	if consumer {
+		items = append(items, item{cfg.IngressQueue, &q.Ingress}, item{cfg.IngressDLQ, &q.DLQ})
+	}
+	if relay {
+		items = append(items, item{cfg.EventsQueue, &q.Events})
+	}
+	for _, it := range items {
+		out, err := c.GetQueueUrl(ctx, &sqs.GetQueueUrlInput{QueueName: aws.String(it.name)})
 		if err != nil {
-			return Queues{}, fmt.Errorf("resolve queue %s: %w", item.name, err)
+			return Queues{}, fmt.Errorf("resolve queue %s: %w", it.name, err)
 		}
-		*item.dst = aws.ToString(out.QueueUrl)
+		*it.dst = aws.ToString(out.QueueUrl)
 	}
 	return q, nil
 }
 
-// Ping checks that the broker answers for the ingress queue (readiness).
+// Ping checks that the broker answers for the given queue (readiness).
 func Ping(ctx context.Context, c *sqs.Client, queueURL string) error {
 	_, err := c.GetQueueAttributes(ctx, &sqs.GetQueueAttributesInput{
 		QueueUrl:       aws.String(queueURL),

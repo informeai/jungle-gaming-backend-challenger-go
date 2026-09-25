@@ -36,8 +36,14 @@ var ObservabilityModule = fx.Module("observability",
 	fx.Provide(func(m *observability.Metrics) app.Metrics { return m }),
 )
 
-// PostgresModule provides the pool (validated on start, closed last) and the
-// repositories bound to the application ports.
+// readiness tags a provider's result as a member of the readiness group.
+func readiness(f any) any {
+	return fx.Annotate(f, fx.ResultTags(`group:"readiness"`))
+}
+
+// PostgresModule provides the wallet_app pool (validated on start, closed
+// last) and the repositories bound to the application ports. Only components
+// that move money (API, consumer, pending worker) include it.
 var PostgresModule = fx.Module("postgres",
 	fx.Provide(
 		newPool,
@@ -51,32 +57,41 @@ var PostgresModule = fx.Module("postgres",
 		func(r *postgres.TransactionRepo) app.TransactionRepository { return r },
 		func(r *postgres.OutboxRepo) app.OutboxRepository { return r },
 		func(r *postgres.InboxRepo) app.InboxRepository { return r },
+		readiness(func(pool *pgxpool.Pool) httpapi.ReadinessCheck {
+			return httpapi.ReadinessCheck{Name: "postgres", Check: func(ctx context.Context) error { return postgres.Ping(ctx, pool) }}
+		}),
 	),
 )
 
 func newPool(lc fx.Lifecycle, cfg config.Config, log *slog.Logger) (*pgxpool.Pool, error) {
-	pool, err := postgres.NewPool(cfg.Database)
+	return openPool(lc, cfg.Database, "postgres", log)
+}
+
+// openPool builds a pool that is pinged on start and closed on stop.
+func openPool(lc fx.Lifecycle, db config.Database, name string, log *slog.Logger) (*pgxpool.Pool, error) {
+	pool, err := postgres.NewPool(db)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%s: %w", name, err)
 	}
 	lc.Append(fx.Hook{
 		OnStart: func(ctx context.Context) error {
 			if err := postgres.Ping(ctx, pool); err != nil {
-				return fmt.Errorf("postgres unavailable: %w", err)
+				return fmt.Errorf("%s unavailable: %w", name, err)
 			}
-			log.Info("postgres connected")
+			log.Info("database connected", slog.String("pool", name))
 			return nil
 		},
 		OnStop: func(context.Context) error {
 			pool.Close()
-			log.Info("postgres pool closed")
+			log.Info("database pool closed", slog.String("pool", name))
 			return nil
 		},
 	})
 	return pool, nil
 }
 
-// SQSModule provides the SQS client and the resolved queue URLs.
+// SQSModule provides the SQS client and the URLs of the queues this process
+// uses (resolved on start; a missing queue aborts the startup).
 var SQSModule = fx.Module("sqs",
 	fx.Provide(newSQS),
 )
@@ -96,7 +111,7 @@ func newSQS(lc fx.Lifecycle, cfg config.Config, log *slog.Logger) (sqsResult, er
 	}
 	queues := &sqs.Queues{}
 	lc.Append(fx.Hook{OnStart: func(ctx context.Context) error {
-		q, err := sqs.ResolveQueues(ctx, client, cfg.SQS)
+		q, err := sqs.ResolveQueues(ctx, client, cfg.SQS, cfg.SQS.ConsumerEnabled, cfg.Outbox.Enabled)
 		if err != nil {
 			return fmt.Errorf("sqs unavailable: %w", err)
 		}
@@ -152,17 +167,20 @@ func newWalletService(p serviceParams) *app.WalletService {
 		Clock: p.Clock, IDs: p.IDs, Metrics: p.Metrics, Log: p.Log})
 }
 
-// WorkersModule registers the SQS consumer, the outbox relay and the
-// pending-reference worker. Each is started after its dependencies and
-// stopped before them (Fx runs OnStop hooks in reverse order).
-var WorkersModule = fx.Module("workers",
-	fx.Provide(newConsumer, newOutboxRelay, newPendingLoop),
-	fx.Invoke(func(*OutboxLoop, *PendingLoop, *sqs.Consumer) {}),
-)
-
 // OutboxLoop and PendingLoop name the worker loops in the Fx graph.
 type OutboxLoop struct{ *worker.Loop }
 type PendingLoop struct{ *worker.Loop }
+
+// RelayPool is the outbox relay's own pool, authenticated as wallet_relay.
+type RelayPool struct{ *pgxpool.Pool }
+
+// ConsumerModule runs the SQS ingress consumer.
+var ConsumerModule = fx.Module("sqs-consumer",
+	fx.Provide(newConsumer, readiness(func(client *awssqs.Client, queues *sqs.Queues) httpapi.ReadinessCheck {
+		return httpapi.ReadinessCheck{Name: "sqs-ingress", Check: func(ctx context.Context) error { return sqs.Ping(ctx, client, queues.Ingress) }}
+	})),
+	fx.Invoke(func(*sqs.Consumer) {}),
+)
 
 func newConsumer(lc fx.Lifecycle, cfg config.Config, client *awssqs.Client, queues *sqs.Queues,
 	svc *app.WageringService, m *observability.Metrics, log *slog.Logger) *sqs.Consumer {
@@ -172,9 +190,6 @@ func newConsumer(lc fx.Lifecycle, cfg config.Config, client *awssqs.Client, queu
 			log.Error("FAULT INJECTION: crashing after commit, before deleting the message", slog.String("messageId", id))
 			os.Exit(137)
 		}
-	}
-	if !cfg.SQS.ConsumerEnabled {
-		return c
 	}
 	lc.Append(fx.Hook{
 		OnStart: func(context.Context) error {
@@ -187,17 +202,37 @@ func newConsumer(lc fx.Lifecycle, cfg config.Config, client *awssqs.Client, queu
 	return c
 }
 
+// OutboxModule runs the outbox relay with its own least-privileged pool: it
+// never holds the credentials that move money.
+var OutboxModule = fx.Module("outbox-relay",
+	fx.Provide(
+		func(lc fx.Lifecycle, cfg config.Config, log *slog.Logger) (RelayPool, error) {
+			db := cfg.Database
+			db.URL = cfg.Outbox.DatabaseURL
+			db.MaxConns = 4
+			pool, err := openPool(lc, db, "outbox-relay", log)
+			return RelayPool{pool}, err
+		},
+		newOutboxRelay,
+		readiness(func(pool RelayPool) httpapi.ReadinessCheck {
+			return httpapi.ReadinessCheck{Name: "postgres-outbox", Check: func(ctx context.Context) error { return postgres.Ping(ctx, pool.Pool) }}
+		}),
+		readiness(func(client *awssqs.Client, queues *sqs.Queues) httpapi.ReadinessCheck {
+			return httpapi.ReadinessCheck{Name: "sqs-events", Check: func(ctx context.Context) error { return sqs.Ping(ctx, client, queues.Events) }}
+		}),
+	),
+	fx.Invoke(func(*OutboxLoop) {}),
+)
+
 func newOutboxRelay(lc fx.Lifecycle, cfg config.Config, client *awssqs.Client, queues *sqs.Queues,
-	repo *postgres.OutboxRepo, m *observability.Metrics, log *slog.Logger) *OutboxLoop {
+	pool RelayPool, m *observability.Metrics, log *slog.Logger) *OutboxLoop {
+	repo := postgres.NewOutboxRepo(postgres.NewTxManager(pool.Pool))
 	var relay *worker.OutboxRelay
 	loop := worker.NewLoop("outbox-relay", cfg.Outbox.PollInterval, log, func(ctx context.Context) {
 		// Drain quickly while there is backlog.
 		for relay.Tick(ctx) == cfg.Outbox.BatchSize && ctx.Err() == nil {
 		}
 	})
-	if !cfg.Outbox.Enabled {
-		return &OutboxLoop{loop}
-	}
 	lc.Append(fx.Hook{
 		OnStart: func(context.Context) error {
 			relay = worker.NewOutboxRelay(repo, sqs.NewEventPublisher(client, *queues), cfg.InstanceID+"/"+uuid.NewString(), cfg.Outbox, m, log)
@@ -215,30 +250,40 @@ func newOutboxRelay(lc fx.Lifecycle, cfg config.Config, client *awssqs.Client, q
 	return &OutboxLoop{loop}
 }
 
+// PendingModule runs the pending-reference worker.
+var PendingModule = fx.Module("pending-reference-worker",
+	fx.Provide(newPendingLoop),
+	fx.Invoke(func(*PendingLoop) {}),
+)
+
 func newPendingLoop(lc fx.Lifecycle, cfg config.Config, svc *app.WageringService, log *slog.Logger) *PendingLoop {
 	resolver := worker.NewPendingResolver(svc, cfg.Pending.BatchSize, log)
 	loop := worker.NewLoop("pending-reference-worker", cfg.Pending.PollInterval, log, resolver.Tick)
-	if cfg.Pending.Enabled {
-		lc.Append(fx.Hook{OnStart: func(context.Context) error { loop.Start(); return nil }, OnStop: loop.Stop})
-	}
+	lc.Append(fx.Hook{OnStart: func(context.Context) error { loop.Start(); return nil }, OnStop: loop.Stop})
 	return &PendingLoop{loop}
 }
 
-// HTTPModule registers the HTTP server. It is invoked last so it stops first:
-// new requests are refused before the workers and connections go away.
+// HTTPModule registers the HTTP server (business routes only when the API
+// component is enabled; health and metrics always). It is invoked last so it
+// stops first: new requests are refused before workers and pools go away.
 var HTTPModule = fx.Module("http",
 	fx.Provide(newAPI, registerServer),
 	fx.Invoke(func(*Server) {}),
 )
 
-func newAPI(cfg config.Config, pool *pgxpool.Pool, client *awssqs.Client, queues *sqs.Queues,
-	wallets *app.WalletService, wagering *app.WageringService, verifier *auth.Verifier,
-	m *observability.Metrics, log *slog.Logger) *httpapi.API {
-	checks := []httpapi.ReadinessCheck{
-		{Name: "postgres", Check: func(ctx context.Context) error { return postgres.Ping(ctx, pool) }},
-		{Name: "sqs", Check: func(ctx context.Context) error { return sqs.Ping(ctx, client, queues.Ingress) }},
-	}
-	return httpapi.NewAPI(wallets, wagering, verifier, m, checks, cfg.HTTP.RequestTimeout, log)
+type apiParams struct {
+	fx.In
+	Cfg      config.Config
+	Wallets  *app.WalletService       `optional:"true"`
+	Wagering *app.WageringService     `optional:"true"`
+	Verifier *auth.Verifier           `optional:"true"`
+	Checks   []httpapi.ReadinessCheck `group:"readiness"`
+	Metrics  *observability.Metrics
+	Log      *slog.Logger
+}
+
+func newAPI(p apiParams) *httpapi.API {
+	return httpapi.NewAPI(p.Wallets, p.Wagering, p.Verifier, p.Metrics, p.Checks, p.Cfg.HTTP.RequestTimeout, p.Log)
 }
 
 // Server exposes the bound address (useful when HTTP_ADDR uses port 0).
@@ -280,23 +325,46 @@ func registerServer(lc fx.Lifecycle, cfg config.Config, api *httpapi.API, log *s
 	return info
 }
 
-// Options composes the whole service.
+// Options composes the service with only the enabled components:
+//
+//	API_ENABLED            HTTP business routes (+ auth, wallet_app pool)
+//	SQS_CONSUMER_ENABLED   ingress consumer     (+ wallet_app pool, SQS ingress/DLQ)
+//	PENDING_WORKER_ENABLED pending references   (+ wallet_app pool)
+//	OUTBOX_ENABLED         outbox relay         (+ wallet_relay pool, SQS events)
+//
+// A process only builds the connections and credentials its components use;
+// with everything enabled it behaves as the single all-in-one service.
 func Options(cfg config.Config) fx.Option {
-	return fx.Options(
+	opts := []fx.Option{
 		fx.Supply(cfg),
 		fx.WithLogger(func(l *slog.Logger) fxevent.Logger {
 			fl := &fxevent.SlogLogger{Logger: l.With(slog.String("component", "fx"))}
 			fl.UseLogLevel(slog.LevelDebug) // container events only in debug; errors stay at error level
 			return fl
 		}),
-		fx.StartTimeout(30*time.Second),
-		fx.StopTimeout(cfg.HTTP.ShutdownTimeout+cfg.SQS.HandlerTimeout+5*time.Second),
+		fx.StartTimeout(30 * time.Second),
+		fx.StopTimeout(cfg.HTTP.ShutdownTimeout + cfg.SQS.HandlerTimeout + 5*time.Second),
 		ObservabilityModule,
-		PostgresModule,
-		SQSModule,
-		AuthModule,
-		AppModule,
-		WorkersModule,
-		HTTPModule,
-	)
+	}
+	if cfg.NeedsAppDatabase() {
+		opts = append(opts, PostgresModule, AppModule)
+	}
+	if cfg.NeedsSQS() {
+		opts = append(opts, SQSModule)
+	}
+	if cfg.HTTP.APIEnabled {
+		opts = append(opts, AuthModule)
+	}
+	// Workers are registered before the HTTP server so that, in reverse order,
+	// the server stops first, then the workers, then the pools.
+	if cfg.SQS.ConsumerEnabled {
+		opts = append(opts, ConsumerModule)
+	}
+	if cfg.Pending.Enabled {
+		opts = append(opts, PendingModule)
+	}
+	if cfg.Outbox.Enabled {
+		opts = append(opts, OutboxModule)
+	}
+	return fx.Options(append(opts, HTTPModule)...)
 }

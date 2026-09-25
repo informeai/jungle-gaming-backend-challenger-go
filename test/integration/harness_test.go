@@ -237,6 +237,7 @@ func baseConfig(q queueSet) config.Config {
 			MaxAttempts: 12, BaseDelay: 200 * time.Millisecond, MaxDelay: time.Second, TTL: time.Minute},
 		OIDC: config.OIDC{Issuer: oidcIssuer, Audience: "wallet-api", ProviderClaim: "provider_id",
 			ProviderRole: "wagering-provider", InternalRole: "wallet-internal"},
+		Breaker: config.Breaker{FailureThreshold: 5, OpenTimeout: 5 * time.Second},
 	}
 }
 
@@ -260,6 +261,7 @@ func configEnv(c config.Config) []string {
 		"REFERENCE_BASE_DELAY=" + c.Pending.BaseDelay.String(), "REFERENCE_MAX_DELAY=" + c.Pending.MaxDelay.String(),
 		"REFERENCE_MAX_ATTEMPTS=" + fmt.Sprint(c.Pending.MaxAttempts), "REFERENCE_TTL=" + c.Pending.TTL.String(),
 		"OIDC_ISSUER=" + c.OIDC.Issuer, "OIDC_AUDIENCE=" + c.OIDC.Audience,
+		"BREAKER_FAILURE_THRESHOLD=" + fmt.Sprint(c.Breaker.FailureThreshold), "BREAKER_OPEN_TIMEOUT=" + c.Breaker.OpenTimeout.String(),
 		"PATH=" + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"),
 	}
 }
@@ -493,6 +495,7 @@ type response struct {
 	Status int
 	Body   map[string]any
 	Raw    string
+	Header http.Header
 }
 
 func (r response) str(path ...string) string {
@@ -534,7 +537,7 @@ func do(t *testing.T, method, u, tok string, body any, headers map[string]string
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
-	r := response{Status: resp.StatusCode, Raw: string(raw)}
+	r := response{Status: resp.StatusCode, Raw: string(raw), Header: resp.Header}
 	_ = json.Unmarshal(raw, &r.Body)
 	return r
 }

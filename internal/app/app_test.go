@@ -326,3 +326,44 @@ func TestCursor(t *testing.T) {
 		}
 	}
 }
+
+// countingTx fails every transaction with a fixed error and counts attempts.
+type countingTx struct {
+	err   error
+	calls int
+}
+
+func (c *countingTx) WithinTx(context.Context, func(context.Context) error) error {
+	c.calls++
+	return c.err
+}
+func (c *countingTx) WithinSnapshot(ctx context.Context, fn func(context.Context) error) error {
+	return c.WithinTx(ctx, fn)
+}
+
+func TestRetryOnlyConcurrencyConflicts(t *testing.T) {
+	cases := map[string]struct {
+		err   error
+		calls int
+	}{
+		"serialization conflict": {&TransientError{Err: errors.New("40001"), Conflict: true}, maxTxAttempts},
+		"version mismatch":       {ErrConcurrentUpdate, maxTxAttempts},
+		// Unavailability is not retried in-request: it would multiply load on
+		// a struggling database; the circuit breaker handles it.
+		"connection refused": {&TransientError{Err: errors.New("dial tcp: connection refused")}, 1},
+		"business error":     {ErrWalletNotFound, 1},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			tx := &countingTx{err: c.err}
+			svc := NewWageringService(WageringDeps{Tx: tx, Metrics: nopMetrics{}, Clock: time.Now,
+				Log: slog.New(slog.NewTextHandler(io.Discard, nil))})
+			if err := svc.retry(context.Background(), func(context.Context) error { return nil }); !errors.Is(err, c.err) {
+				t.Fatalf("err = %v", err)
+			}
+			if tx.calls != c.calls {
+				t.Fatalf("attempts = %d, want %d", tx.calls, c.calls)
+			}
+		})
+	}
+}

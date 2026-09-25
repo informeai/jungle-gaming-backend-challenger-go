@@ -67,7 +67,7 @@ func (r *recordingPublisher) Publish(ctx context.Context, m postgres.OutboxMessa
 func newRelay(t *testing.T, pub worker.Publisher, cfg config.Outbox) *worker.OutboxRelay {
 	t.Helper()
 	// The relay runs with its real least-privileged role (wallet_relay).
-	txm := postgres.NewTxManager(relayPool)
+	txm := postgres.NewTxManager(relayPool, nil)
 	return worker.NewOutboxRelay(postgres.NewOutboxRepo(txm), pub, "relay-"+uuid.NewString()[:8], cfg, observability.NewMetrics(), quietLog)
 }
 

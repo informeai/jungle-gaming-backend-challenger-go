@@ -4,7 +4,6 @@ package integration
 
 import (
 	"context"
-	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -223,13 +222,18 @@ func TestThreeIndependentProcesses(t *testing.T) {
 
 // ------------------------------------------------ PostgreSQL unavailable ---
 
-// toggleProxy is a TCP proxy to PostgreSQL that can drop every connection.
+// toggleProxy is a TCP proxy to a dependency (PostgreSQL, LocalStack) that
+// can refuse every connection (SetDown) or black-hole traffic (SetHang):
+// connections are accepted but nothing is ever answered, the worst kind of
+// outage because callers only find out by timing out.
 type toggleProxy struct {
-	ln     net.Listener
-	target string
-	down   atomic.Bool
-	mu     sync.Mutex
-	conns  []net.Conn
+	ln       net.Listener
+	target   string
+	down     atomic.Bool
+	hang     atomic.Bool
+	attempts atomic.Int64 // connection attempts received
+	mu       sync.Mutex
+	conns    []net.Conn
 }
 
 func newToggleProxy(t *testing.T, target string) *toggleProxy {
@@ -249,8 +253,15 @@ func (p *toggleProxy) serve() {
 		if err != nil {
 			return
 		}
+		p.attempts.Add(1)
 		if p.down.Load() {
 			c.Close()
+			continue
+		}
+		if p.hang.Load() {
+			p.mu.Lock()
+			p.conns = append(p.conns, c) // held open, never answered
+			p.mu.Unlock()
 			continue
 		}
 		up, err := net.Dial("tcp", p.target)
@@ -261,10 +272,30 @@ func (p *toggleProxy) serve() {
 		p.mu.Lock()
 		p.conns = append(p.conns, c, up)
 		p.mu.Unlock()
-		go func() { _, _ = io.Copy(up, c); up.Close() }()
-		go func() { _, _ = io.Copy(c, up); c.Close() }()
+		go func() { p.pump(up, c); up.Close() }()
+		go func() { p.pump(c, up); c.Close() }()
 	}
 }
+
+// pump forwards bytes, silently dropping them while hanging.
+func (p *toggleProxy) pump(dst, src net.Conn) {
+	buf := make([]byte, 32<<10)
+	for {
+		n, err := src.Read(buf)
+		if err != nil {
+			return
+		}
+		if p.hang.Load() {
+			continue
+		}
+		if _, err := dst.Write(buf[:n]); err != nil {
+			return
+		}
+	}
+}
+
+// SetHang black-holes new and existing connections (true) or restores them.
+func (p *toggleProxy) SetHang(hang bool) { p.hang.Store(hang) }
 
 func (p *toggleProxy) cut() {
 	p.mu.Lock()

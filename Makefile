@@ -1,4 +1,4 @@
-.PHONY: up deps down build test test-race vet fmt integration integration-race migrate-up migrate-down demo
+.PHONY: up deps down build test test-race vet fmt integration integration-race migrate-up migrate-down demo sqs-demo
 
 up:            ## full stack: postgres, keycloak, localstack, migrations and 3 API instances
 	docker compose up --build -d
@@ -38,3 +38,6 @@ migrate-down:
 
 demo:          ## end-to-end calls against http://localhost:8081
 	scripts/demo.sh
+
+sqs-demo:      ## SQS ingress: send, redelivery (inbox), HTTP replay, DLQ, published events
+	scripts/sqs-demo.sh

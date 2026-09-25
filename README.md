@@ -190,7 +190,9 @@ aws --endpoint-url http://localhost:4566 sqs send-message \
     \"money\":{\"amount\":\"25.00\",\"currency\":\"BRL\"}}}"
 ```
 
-(sem AWS CLI: `docker compose exec localstack awslocal sqs send-message ...`). Contratos de `MessageGroupId`, `MessageDeduplicationId`, retries e DLQ: [`ARCHITECTURE.md`](ARCHITECTURE.md#consumidor-sqs).
+(sem AWS CLI: `docker compose exec localstack awslocal sqs send-message ...`).
+
+Para ver o fluxo completo da fila de uma vez, rode `make sqs-demo` (script `scripts/sqs-demo.sh`, com a stack do compose no ar). Ele abre uma carteira, envia uma `BET` pela fila e espera o consumidor processar; reentrega a mesma mensagem (a inbox deduplica e o saldo não muda); repete a operação por HTTP (replay idempotente); envia uma mensagem inválida, que vai para a DLQ com o motivo; e lista os eventos que o relay publicou para a carteira. Contratos de `MessageGroupId`, `MessageDeduplicationId`, retries e DLQ: [`ARCHITECTURE.md`](ARCHITECTURE.md#consumidor-sqs).
 
 ## Migrations
 

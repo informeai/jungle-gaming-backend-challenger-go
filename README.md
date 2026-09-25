@@ -21,7 +21,7 @@ Serviço de carteira para provedores de jogos: API HTTP + consumidor SQS que mov
 
 ## Pré-requisitos
 
-- Docker + Docker Compose v2 (≈ 3 GB de RAM livres para Keycloak, LocalStack, Postgres e 3 instâncias).
+- Docker + Docker Compose v2 (≈ 3 GB de RAM livres para Keycloak, LocalStack, Postgres e os 9 processos do serviço, ~10–25 MB cada).
 - Go 1.26.5+ (apenas para rodar testes/ferramentas fora do container).
 - `curl` e `python3` (usados pelos scripts de exemplo).
 - Portas livres: `5432` (Postgres), `8180` (Keycloak), `4566` (LocalStack), `8081-8083` (API).
@@ -36,18 +36,29 @@ O Compose sobe, na ordem:
 
 | Serviço | Porta | O que faz |
 | --- | --- | --- |
-| `postgres` | 5432 | Banco `wallet`; `deploy/postgres/init.sql` cria o papel de runtime `wallet_app` (sem DELETE/TRUNCATE/DDL). |
+| `postgres` | 5432 | Banco `wallet`; `deploy/postgres/init.sql` cria os papéis de runtime `wallet_app` e `wallet_relay` (os GRANTs vêm das migrations). |
 | `keycloak` | 8180 | IdP. Importa automaticamente o realm `jungle` (`deploy/keycloak/jungle-realm.json`) com clientes, papéis e claims. Admin: `admin`/`admin`. |
-| `localstack` | 4566 | SQS. `deploy/localstack/init-sqs.sh` cria as filas FIFO, as DLQs, a redrive policy e a política de acesso. |
+| `localstack` | 4566 | SQS. `deploy/localstack/init-sqs.sh` cria as filas FIFO, as DLQs, a redrive policy e as políticas de acesso por identidade. |
 | `migrate` | — | `wallet-service migrate up` como owner do banco; termina antes das APIs subirem. |
-| `api-1`, `api-2`, `api-3` | 8081, 8082, 8083 | Três processos independentes (memória e pool próprios), cada um com HTTP, consumidor SQS, relay da outbox e worker de referências pendentes. |
+| `api-1..3` | 8081–8083 | API HTTP (3 processos). Papel `wallet_app`; **sem credencial AWS**. |
+| `consumer-1..2` | interna | Consumidor SQS. Papel `wallet_app`; identidade AWS `wallet-consumer`. |
+| `pending-worker-1..2` | interna | Worker de referências pendentes. Papel `wallet_app`; sem AWS. |
+| `outbox-relay-1..2` | interna | Relay da outbox. Papel `wallet_relay` (só outbox); identidade AWS `wallet-outbox-relay`; **não recebe `DATABASE_URL`**. |
 
-Todos os serviços têm healthcheck; as APIs só sobem com banco migrado, Keycloak e filas prontos. Para verificar:
+### Componentes separados com menor privilégio
+
+É a **mesma imagem** com flags diferentes (`API_ENABLED`, `SQS_CONSUMER_ENABLED`, `PENDING_WORKER_ENABLED`, `OUTBOX_ENABLED`). Cada componente monta só as conexões e credenciais que usa, e os workers não publicam porta no host (servem `/health/*` e `/metrics` apenas na rede interna). Com todas as flags ligadas (padrão), o binário roda como um serviço único, útil fora do Docker. Motivação e modelo de privilégios: [`ARCHITECTURE.md`](ARCHITECTURE.md#componentes-e-menor-privilégio).
+
+Todos os serviços têm healthcheck e só sobem com banco migrado, Keycloak e filas prontos. A readiness verifica apenas as dependências do componente:
 
 ```sh
 curl -s localhost:8081/health/ready
-# {"dependencies":{"postgres":"UP","sqs":"UP"},"status":"UP"}
+# {"dependencies":{"postgres":"UP"},"status":"UP"}
+docker compose exec outbox-relay-1 wget -qO- localhost:8080/health/ready
+# {"dependencies":{"postgres-outbox":"UP","sqs-events":"UP"},"status":"UP"}
 ```
+
+> Se você já tinha um volume do Postgres criado antes do papel `wallet_relay` existir, recrie-o: `docker compose down -v` (o `init.sql` só roda num volume vazio).
 
 Para derrubar e limpar volumes: `docker compose down -v`.
 
@@ -208,20 +219,21 @@ Todas têm valores de exemplo em [`.env.example`](.env.example). As principais:
 | `INSTANCE_ID` | hostname | Identidade da instância em logs e no lease da outbox. |
 | `HTTP_ADDR` | `:8080` | Endereço HTTP. |
 | `HTTP_REQUEST_TIMEOUT` / `HTTP_SHUTDOWN_TIMEOUT` | `10s` / `15s` | Prazo por requisição / para drenar requisições no shutdown. |
-| `DATABASE_URL` | — (obrigatória) | Conexão de runtime (`wallet_app`). |
+| `API_ENABLED`, `SQS_CONSUMER_ENABLED`, `PENDING_WORKER_ENABLED`, `OUTBOX_ENABLED` | `true` | Componentes ativos no processo (pelo menos um). |
+| `DATABASE_URL` | — | Conexão `wallet_app`; obrigatória para API, consumidor e worker de pendências. |
+| `OUTBOX_DATABASE_URL` | — | Conexão `wallet_relay`; obrigatória quando `OUTBOX_ENABLED=true`. |
 | `MIGRATIONS_DATABASE_URL` | — | Conexão do owner usada por `migrate`. |
 | `DATABASE_MAX_CONNS` | `20` | Tamanho do pool por instância. |
 | `AWS_REGION`, `AWS_ENDPOINT_URL`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | — | Acesso ao SQS/LocalStack. |
 | `SQS_INGRESS_QUEUE`, `SQS_INGRESS_DLQ`, `SQS_EVENTS_QUEUE` | nomes acima | Filas (URLs resolvidas no start; ausência aborta a inicialização). |
-| `SQS_CONSUMER_ENABLED` | `true` | Liga o consumidor. |
 | `SQS_VISIBILITY_TIMEOUT` / `SQS_HANDLER_TIMEOUT` | `30s` / `10s` | O prazo do handler precisa ser menor que a visibilidade (validado no start). |
 | `SQS_MAX_RECEIVES` | `5` | Tentativas antes de mover para a DLQ. |
 | `SQS_RETRY_BASE_DELAY` / `SQS_RETRY_MAX_DELAY` | `2s` / `60s` | Backoff exponencial (via visibility timeout) em falhas transitórias. |
 | `SQS_CONCURRENCY` | `4` | Grupos FIFO processados em paralelo por instância. |
 | `SQS_ALLOWED_PROVIDERS` | `provider-a,provider-b` | Provedores aceitos pela fila. |
-| `OUTBOX_ENABLED`, `OUTBOX_POLL_INTERVAL`, `OUTBOX_BATCH_SIZE`, `OUTBOX_LEASE`, `OUTBOX_BASE_BACKOFF`, `OUTBOX_MAX_BACKOFF` | `true`, `500ms`, `50`, `30s`, `1s`, `5m` | Relay da outbox. |
+| `OUTBOX_POLL_INTERVAL`, `OUTBOX_BATCH_SIZE`, `OUTBOX_LEASE`, `OUTBOX_BASE_BACKOFF`, `OUTBOX_MAX_BACKOFF` | `500ms`, `50`, `30s`, `1s`, `5m` | Relay da outbox. |
 | `PENDING_WORKER_ENABLED`, `PENDING_POLL_INTERVAL`, `REFERENCE_MAX_ATTEMPTS`, `REFERENCE_BASE_DELAY`, `REFERENCE_MAX_DELAY`, `REFERENCE_TTL` | `true`, `1s`, `12`, `1s`, `1m`, `30m` | Referências pendentes. |
-| `OIDC_ISSUER` | — (obrigatória) | Issuer esperado (`http://localhost:8180/realms/jungle`). |
+| `OIDC_ISSUER` | — (obrigatória com API) | Issuer esperado (`http://localhost:8180/realms/jungle`). |
 | `OIDC_JWKS_URL` | `<issuer>/protocol/openid-connect/certs` | JWKS (no compose: `http://keycloak:8080/...`). |
 | `OIDC_AUDIENCE` | `wallet-api` | Audiência exigida. |
 | `OIDC_PROVIDER_CLAIM`, `OIDC_PROVIDER_ROLE`, `OIDC_INTERNAL_ROLE` | `provider_id`, `wagering-provider`, `wallet-internal` | Modelo de permissões. |
@@ -250,6 +262,8 @@ Cada execução cria um banco novo (`it_<id>`, removido ao final; `IT_KEEP_DB=1`
 | Teste | Cenário |
 | --- | --- |
 | `TestMigrationsUpDownUp` | Aplicação e reversão das migrations. |
+| `TestLeastPrivilegeByComponent` | Com os papéis reais: o relay não lê carteiras/transações/ledger/inbox, não insere nem altera payload de eventos; `wallet_app` não lê, reivindica nem marca eventos como publicados. |
+| `TestComponentsRunSeparately` | API, consumidor, worker e relay como 4 aplicações Fx separadas (o relay sem `DATABASE_URL`): fluxo HTTP + SQS + pendência + publicação; readiness por componente; workers sem rotas de negócio. |
 | `TestSchemaInvariants` | Constraints e triggers: ledger imutável (UPDATE/DELETE/TRUNCATE), saldo não negativo, mudança de saldo sem ledger, versão, abertura duplicada, PENDING nunca commitado, papel `wallet_app` sem DELETE. |
 | `TestAuthenticationWithKeycloak` | Token ausente, inválido, assinatura adulterada, outra audiência, expirado (token real do Keycloak); nenhuma movimentação. |
 | `TestAuthorizationAndProviderIsolation` | Operações de carteira só para o interno; provedor não age nem lê como outro; replay isolado por provedor. |
@@ -277,11 +291,11 @@ Unitários cobrem `Money` (parsing, escala, limites de `int64`, overflow, `NaN`/
 ### Múltiplas instâncias e simulação de falhas manualmente
 
 ```sh
-docker compose up --build -d                 # 3 instâncias: 8081, 8082, 8083
+docker compose up --build -d                 # 3 APIs (8081-8083) + 2 consumers, 2 relays, 2 pending workers
 go run ./cmd/loadtest -wallets 50 -ops 5000 -concurrency 64 -duplicates 0.1
-docker compose kill -s SIGKILL api-2          # queda abrupta; as demais seguem
+docker compose kill -s SIGKILL api-2 consumer-1 outbox-relay-1   # quedas abruptas; as réplicas seguem
 docker compose stop api-3                     # SIGTERM: shutdown gracioso (ver logs)
-docker compose start api-2 api-3
+docker compose start api-2 api-3 consumer-1 outbox-relay-1
 ```
 
 Falhas específicas com `FAULT_INJECTION=consumer-crash-after-commit` ou `outbox-crash-after-publish` numa instância (ver testes correspondentes).
@@ -301,7 +315,7 @@ outbox:      backlog de ~13k eventos no pico, drenado ~2s após o fim da carga
 reconciliation: 50 wallets consistent
 ```
 
-Não há meta de RPS; os números servem de linha de base.
+Não há meta de RPS; os números servem de linha de base e **variam bastante com o estado do host** (Docker Desktop). Ao separar os componentes, uma comparação A/B na mesma máquina e no mesmo momento deu 513–542 req/s para a versão anterior (tudo em um processo) e 600–700 req/s para a separada: a separação não reduziu o throughput. Com carga, a publicação da outbox compete por CPU com o LocalStack (~25% da variação medida) e o backlog drena ~5s após o fim.
 
 ## Observabilidade
 

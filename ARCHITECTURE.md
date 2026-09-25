@@ -26,6 +26,37 @@ Camadas e dependências (de fora para dentro):
 - `internal/infra/postgres`, `internal/infra/sqs`, `internal/httpapi`, `internal/auth`, `internal/worker` — adaptadores.
 - `internal/bootstrap` — raiz de composição com Uber Fx.
 
+## Componentes e menor privilégio
+
+O serviço é **um binário e uma imagem**, mas roda como **quatro componentes** que podem ser processos separados. Cada processo liga os seus com flags e monta **só as conexões e credenciais que usa** (`bootstrap.Options` inclui apenas os módulos Fx necessários):
+
+| Componente | Flag | Papel no Postgres | Identidade AWS | Porta | Réplicas no compose |
+| --- | --- | --- | --- | --- | --- |
+| API HTTP | `API_ENABLED` | `wallet_app` | nenhuma | pública (8081–8083) | 3 |
+| Consumidor SQS | `SQS_CONSUMER_ENABLED` | `wallet_app` | `wallet-consumer` | interna | 2 |
+| Worker de referências | `PENDING_WORKER_ENABLED` | `wallet_app` | nenhuma | interna | 2 |
+| Relay da outbox | `OUTBOX_ENABLED` | `wallet_relay` | `wallet-outbox-relay` | interna | 2 |
+
+**Privilégios no banco** (migration `000002`, aplicados pelo Postgres de verdade):
+
+- `wallet_app` (movimenta dinheiro): `SELECT/INSERT/UPDATE` em carteiras, transações e inbox; `SELECT/INSERT` no ledger; **só `INSERT` na outbox** — grava o evento na mesma transação da operação, mas não consegue lê-lo, reivindicá-lo nem marcá-lo como publicado. Nenhum `DELETE`/`TRUNCATE`/DDL.
+- `wallet_relay` (publica eventos): `SELECT` na outbox e `UPDATE` **por coluna** apenas em `attempts`, `next_attempt_at`, `locked_by`, `locked_until`, `published_at` e `last_error`. Não enxerga carteiras, transações, ledger nem inbox, não insere eventos e não altera `payload`/`event_type` (além do trigger de imutabilidade). O processo do relay **nem recebe** `DATABASE_URL`.
+
+**Privilégios no broker** (`init-sqs.sh`): `provider-gateway` só envia para a fila de entrada; `wallet-consumer` só consome a entrada e envia para a DLQ; `wallet-outbox-relay` só envia para `wallet-events.fifo`; a API não tem identidade AWS. Cada processo resolve apenas as filas que usa, então também funciona com credenciais restritas a elas. **O LocalStack Community não aplica IAM** — no ambiente local essas políticas são declarativas; a garantia verificável localmente é a do banco.
+
+**O que a separação protege:**
+
+- Superfície de ataque: só a API recebe tráfego externo; workers não têm rotas de negócio nem porta publicada (servem `/health/*` e `/metrics` na rede interna).
+- Raio de impacto: uma API comprometida não publica eventos falsos em `wallet-events` (sem credencial AWS e sem acesso de leitura/claim da outbox); um relay comprometido não movimenta dinheiro nem forja eventos (não insere nem altera payload).
+- Segredos: workers não recebem configuração OIDC; a API não recebe chaves AWS; o relay não recebe a credencial `wallet_app`.
+- Operação: escala independente (API por RPS, consumidor pela profundidade da fila, relay pelo atraso da outbox) e falhas isoladas por processo.
+
+**Por que é seguro separar:** nenhum componente depende de estado em memória nem de outro processo. A coordenação é toda no Postgres (lock por carteira, índices únicos, `SKIP LOCKED` + lease na outbox, `next_attempt_at` nas pendências), então qualquer combinação e número de processos mantém as mesmas garantias. Verificado por `TestComponentsRunSeparately` (4 aplicações Fx separadas, relay sem `DATABASE_URL`) e `TestLeastPrivilegeByComponent` (negações e permissões com os papéis reais).
+
+**Riscos e mitigações:** mais serviços para operar (mitigado por imagem única e flags); worker parado não perde dados, mas atrasa eventos/pendências (réplicas ≥ 2, readiness por componente e métricas `outbox_lag_seconds`/`outbox_pending_events` para alerta); GRANTs errados só apareceriam em runtime (cobertos pelos testes de integração com os papéis reais); versões diferentes compartilhando o schema exigem migrations compatíveis (expand/contract).
+
+Com todas as flags ligadas (padrão), o mesmo binário roda como um serviço único, usado fora do Docker e nos testes que simulam instâncias completas.
+
 ## Dinheiro
 
 - **Representação:** `money.Money{minor int64, currency Currency}` — unidades mínimas (centavos) com **escala fixa de 2 casas**. Intervalo: `[-92 233 720 368 547 758.08, 92 233 720 368 547 758.07]`.
@@ -62,7 +93,7 @@ Triggers (proteção independente da aplicação):
 - `wager_guard_update`: estados terminais são finais; campos de negócio (valor, tipo, carteira, provedor, chave, hash...) são imutáveis; nada volta para `PENDING`.
 - `wager_no_committed_pending` (deferred): uma transação nunca é commitada em `PENDING`.
 - `outbox_guard_update`: o snapshot do evento é imutável e `published_at` não pode ser desfeito.
-- **Menor privilégio:** a aplicação conecta como `wallet_app`, que só tem `SELECT/INSERT/UPDATE` (e apenas `SELECT/INSERT` no ledger). Migrations rodam como owner.
+- **Menor privilégio:** papéis `wallet_app` e `wallet_relay` por componente (ver [Componentes e menor privilégio](#componentes-e-menor-privilégio)). Migrations rodam como owner.
 
 ## Carteira e controle de concorrência
 
@@ -221,18 +252,18 @@ Tipo e versão são fixados pelos construtores em `internal/domain/events`; data
   - `wagering-provider` + claim `provider_id` (mapper *hardcoded claim* por cliente): envia operações e lê as próprias transações. O `providerId` **vem do token**; corpo com outro provedor → `403 PROVIDER_MISMATCH` sem efeito. Leitura por id de transação de outro provedor → `404` (não revela existência); pela rota `/providers/{id}` de outro → `403`. A idempotência é escopada por provedor, então replays também são isolados.
   - `wallet-internal`: operações de carteira (abrir, consultar, ledger, reconciliação) e leitura de qualquer transação. Não envia operações de provedor.
   - Token válido sem papel → `403`. Token ausente/inválido/expirado/de outra audiência → `401`. Nenhum desses casos toca o banco.
-- **Mensageria:** o acesso ao broker é por credenciais e política da fila: o produtor (`provider-gateway`) só tem `SendMessage` na fila de entrada; o serviço (`wallet-service`) só consome. As políticas são aplicadas pelo `init-sqs.sh`. **O LocalStack Community não aplica IAM**, então localmente elas são declarativas (na AWS, seriam aplicadas). Por isso o consumidor mantém as validações de domínio: envelope estrito, provedor permitido (`SQS_ALLOWED_PROVIDERS`), mesmas regras e idempotência do HTTP.
+- **Mensageria:** o acesso ao broker é por credenciais e política de cada fila, com uma identidade por componente (ver [Componentes e menor privilégio](#componentes-e-menor-privilégio)): o produtor (`provider-gateway`) só tem `SendMessage` na fila de entrada; o consumidor só consome a entrada e envia à DLQ; o relay só publica eventos. As políticas são aplicadas pelo `init-sqs.sh`. **O LocalStack Community não aplica IAM**, então localmente elas são declarativas (na AWS, seriam aplicadas). Por isso o consumidor mantém as validações de domínio: envelope estrito, provedor permitido (`SQS_ALLOWED_PROVIDERS`), mesmas regras e idempotência do HTTP.
 
 ## Uso do Fx e ciclo de vida
 
-- `internal/bootstrap` compõe módulos com `fx.Module`: `observability`, `postgres`, `sqs`, `auth`, `app`, `workers`, `http`. Tudo por construtores (`fx.Provide`); portas ligadas às implementações por construtores adaptadores; `fx.Invoke` ativa workers e servidor. `fx.ValidateApp` roda nos testes unitários.
+- `internal/bootstrap` compõe módulos com `fx.Module`: `observability`, `postgres`, `sqs`, `auth`, `app`, `sqs-consumer`, `pending-reference-worker`, `outbox-relay`, `http`. `Options(cfg)` inclui só os módulos dos componentes ativos, então um processo nunca constrói conexões ou credenciais de que não precisa. Tudo por construtores (`fx.Provide`); portas ligadas às implementações por construtores adaptadores; checagens de readiness num *value group* (`group:"readiness"`); `fx.Invoke` ativa workers e servidor. `fx.ValidateApp` roda nos testes unitários para o serviço completo e para cada componente isolado.
 - **Inicialização:** `config.Load` valida a configuração (obrigatórias, limites, `handler timeout < visibility timeout`) antes do Fx. Os hooks `OnStart` validam dependências: ping no Postgres, resolução das URLs das filas (falha se alguma não existir), listen do HTTP (erro de bind aborta o start). Workers começam depois das dependências.
 - **Workers** (`worker.Loop`): goroutine com contexto cancelável e canal `done`; `Stop` cancela, espera o término dentro do prazo e registra; `Running()` expõe o estado (usado em `TestFxLifecycle`).
 - **Shutdown** (ordem inversa, verificada nos logs do compose):
   1. HTTP: readiness passa a `503` (drain), `Server.Shutdown` para de aceitar conexões e aguarda as requisições em andamento.
   2. Consumidor SQS: para de buscar mensagens, conclui o que está em andamento ou cancela e libera a visibilidade.
   3. Worker de referências e relay da outbox: param entre ciclos; leases não usados são devolvidos.
-  4. Pool do Postgres é fechado por último.
+  4. Pools do Postgres (`wallet_app` e, no relay, `wallet_relay`) são fechados por último.
 - Prazos: `HTTP_SHUTDOWN_TIMEOUT`, `SQS_HANDLER_TIMEOUT` e `fx.StopTimeout` (soma de ambos + margem); `stop_grace_period: 40s` no Compose.
 
 ## Observabilidade
@@ -252,7 +283,7 @@ Logs JSON com identificadores de rastreio, métricas Prometheus (resultado por s
 
 ## Limitações e trabalho não concluído
 
-- **IAM do SQS** não é aplicado pelo LocalStack Community (ver acima).
+- **IAM do SQS** não é aplicado pelo LocalStack Community (ver acima): as políticas por componente são declarativas localmente; o menor privilégio verificável é o do Postgres.
 - **Ordem global de eventos por carteira** não é estrita com vários relays: o grupo FIFO preserva a ordem de *publicação*, que pode diferir da ordem de commit quando dois relays publicam eventos da mesma carteira ao mesmo tempo. Consumidores devem usar `walletVersion`. Uma alternativa seria reivindicar só o evento mais antigo pendente de cada `partition_key`.
 - **Retenção** de inbox e outbox publicadas não é feita (sem job de limpeza/particionamento).
 - **Partidas dobradas**, **tracing OpenTelemetry** e **dashboards** não implementados.

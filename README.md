@@ -325,6 +325,44 @@ Não há meta de RPS; os números servem de linha de base e **variam bastante co
 - **Métricas** em `/metrics`: `wager_transactions_total{source,kind,status,replay}`, `wager_duplicates_total`, `wager_idempotency_conflicts_total`, `wallet_concurrency_conflicts_total`, `wager_processing_seconds`, `wager_reference_retries_total`, `sqs_messages_total{outcome}`, `sqs_message_retries_total`, `sqs_dlq_messages_total{reason}`, `outbox_published_total`, `outbox_publish_failures_total`, `outbox_pending_events`, `outbox_lag_seconds`, `outbox_publish_delay_seconds`, `wallet_reconciliations_total`, `wallet_reconciliation_divergences_total`, `http_requests_total`.
 - **Health**: `/health/live` e `/health/ready`.
 
+### Prometheus e Grafana (opcional)
+
+```sh
+make observability      # = docker compose --profile observability up --build -d
+```
+
+Sobe a stack completa mais:
+
+| Serviço | URL | O que tem |
+| --- | --- | --- |
+| Prometheus | http://localhost:9090 | Coleta os 9 componentes a cada 5s pela rede interna (os workers não publicam porta), com o label `component`. Aba *Alerts* com as regras de `deploy/prometheus/alerts.yml`. |
+| Grafana | http://localhost:3000 | Dashboard **Wallet Service** já provisionado (datasource e dashboard vêm de arquivos). Acesso anônimo como *Viewer*; admin: `admin`/`admin`. |
+
+O dashboard tem filtro por componente e seis seções:
+- **Visão geral:** operações/s, latência p95, atraso e backlog da outbox, mensagens na DLQ e divergências de saldo, estes três com cor de status.
+- **Operações:** resultados por status, latência por origem e percentis, duplicatas e conflitos.
+- **Mensageria:** resultados do consumidor, retries, DLQ e motivos de DLQ.
+- **Outbox:** pendentes, atraso e publicações.
+- **Referências e reconciliação.**
+- **Saúde:** UP/DOWN de cada instância e requisições HTTP por classe de status.
+
+Regras de alerta:
+
+| Alerta | Condição |
+| --- | --- |
+| `ComponentDown` | uma instância deixou de responder à coleta por 30s |
+| `NoOutboxRelayRunning` | nenhum relay no ar por 1 min |
+| `OutboxLagHigh` | evento mais antigo esperando mais de 30s por 1 min |
+| `MessagesSentToDLQ` | mensagem movida para a DLQ nos últimos 5 min |
+| `ReconciliationDivergence` | divergência entre saldo e ledger em 15 min |
+| `HighTransientErrorRate` | API respondendo 503 |
+
+Não há Alertmanager configurado: localmente os alertas aparecem só na UI do Prometheus.
+
+Para ver funcionando: rode `go run ./cmd/loadtest` e `make sqs-demo` com o dashboard aberto, ou pare os relays (`docker compose stop outbox-relay-1 outbox-relay-2`) e veja `ComponentDown` e `NoOutboxRelayRunning` dispararem em cerca de 1 min.
+
+O Prometheus roda com `--enable-feature=created-timestamp-zero-ingestion`. Sem isso, o primeiro evento de um label novo (por exemplo, a primeira mensagem de um motivo de DLQ) seria tratado como linha de base, e `increase()` mostraria 0.
+
 ## Estrutura do projeto
 
 ```
@@ -340,6 +378,6 @@ internal/worker        relay da outbox, worker de referências pendentes, loop c
 internal/bootstrap     composição Fx (fx.Module/Provide/Invoke + lifecycle)
 internal/observability logger JSON e métricas
 migrations/            SQL versionado (up/down)
-deploy/                Keycloak realm, init do Postgres, provisionamento SQS
+deploy/                Keycloak realm, init do Postgres, provisionamento SQS, Prometheus (scrape + alertas) e Grafana (datasource + dashboard)
 test/integration       testes com infraestrutura real (build tag integration)
 ```

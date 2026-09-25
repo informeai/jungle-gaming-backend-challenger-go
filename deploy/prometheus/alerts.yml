@@ -1,0 +1,51 @@
+# Alert rules shown in the Prometheus UI (Alerts tab). No Alertmanager is
+# configured locally; in production these would route to on-call.
+groups:
+  - name: wallet-service
+    rules:
+      - alert: ComponentDown
+        expr: up{job="wallet-service"} == 0
+        for: 30s
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $labels.component }} {{ $labels.instance }} is down"
+          description: "Prometheus cannot scrape the component; replicas keep serving but capacity is reduced."
+
+      - alert: OutboxLagHigh
+        # Every relay reports the same global value, so max() and not sum().
+        expr: max(outbox_lag_seconds) > 30
+        for: 1m
+        labels: { severity: warning }
+        annotations:
+          summary: "Outbox events waiting {{ $value | humanizeDuration }}"
+          description: "Relays stopped or slow (or SQS unavailable). Events are not lost, only delayed."
+
+      - alert: NoOutboxRelayRunning
+        expr: absent(up{component="outbox-relay"} == 1)
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "No outbox relay is running"
+          description: "Committed events will not be published until a relay comes back."
+
+      - alert: MessagesSentToDLQ
+        expr: sum by (reason) (increase(sqs_dlq_messages_total[5m])) > 0
+        labels: { severity: warning }
+        annotations:
+          summary: "Ingress messages moved to the DLQ (reason {{ $labels.reason }})"
+          description: "Inspect wager-transactions-dlq.fifo; the dlqReason attribute explains each message."
+
+      - alert: ReconciliationDivergence
+        expr: sum(increase(wallet_reconciliation_divergences_total[15m])) > 0
+        labels: { severity: critical }
+        annotations:
+          summary: "Stored balance differs from the ledger"
+          description: "A reconciliation found stored balance != credits - debits. Check the error logs for the walletId."
+
+      - alert: HighTransientErrorRate
+        expr: sum(rate(http_requests_total{code="503"}[5m])) > 1
+        for: 2m
+        labels: { severity: warning }
+        annotations:
+          summary: "API returning 503 (dependency unavailable)"
+          description: "PostgreSQL or a timeout is failing requests; clients should retry with the same Idempotency-Key."

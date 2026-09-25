@@ -1,0 +1,21 @@
+# Scrapes every wallet-service component through the compose network. Worker
+# components publish no host port; Prometheus reaches their internal :8080.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 15s
+
+rule_files:
+  - alerts.yml
+
+scrape_configs:
+  - job_name: wallet-service
+    metrics_path: /metrics
+    static_configs:
+      - targets: [api-1:8080, api-2:8080, api-3:8080]
+        labels: { component: api }
+      - targets: [consumer-1:8080, consumer-2:8080]
+        labels: { component: consumer }
+      - targets: [pending-worker-1:8080, pending-worker-2:8080]
+        labels: { component: pending-worker }
+      - targets: [outbox-relay-1:8080, outbox-relay-2:8080]
+        labels: { component: outbox-relay }

@@ -270,6 +270,14 @@ Tipo e versão são fixados pelos construtores em `internal/domain/events`; data
 
 Logs JSON com identificadores de rastreio, métricas Prometheus (resultado por status, duplicatas, conflitos de idempotência e concorrência, retries de SQS e referências, DLQ por motivo, atraso e backlog da outbox, latência, divergências de reconciliação) e health checks. A reconciliação registra `ERROR` e incrementa `wallet_reconciliation_divergences_total` quando há diferença; ela nunca altera saldo.
 
+**Visualização (opcional, profile `observability`):**
+- **Coleta e rótulos:** o Prometheus coleta todos os componentes pela rede interna e rotula cada um com `component`. As métricas globais da outbox (`outbox_pending_events`, `outbox_lag_seconds`) são reportadas igualmente por todos os relays, então os painéis e alertas usam `max()`, nunca `sum()`.
+- **Contadores com label novo:** ativamos `created-timestamp-zero-ingestion` para que o primeiro incremento de um label novo seja contado por `increase()`/`rate()`. O primeiro motivo de DLQ, por exemplo, apareceria como 0 sem isso.
+- **Grafana:** o datasource e o dashboard **Wallet Service** vêm de arquivos, então o ambiente é reproduzível sem configurar nada na mão.
+- **Cores do dashboard:** cada série tem cor fixa por nome, com paleta categórica validada para daltonismo no tema escuro. Cores de status (verde, amarelo, vermelho) aparecem só onde há estado: UP/DOWN, DLQ, divergência, atraso da outbox. Estados trazem o texto além da cor.
+- **Eixos:** um eixo por painel; medidas de unidades diferentes ficam em painéis separados.
+- **Alertas:** as regras em `deploy/prometheus/alerts.yml` cobrem componente fora, ausência de relay, atraso da outbox, DLQ, divergência de reconciliação e taxa de 503. Localmente aparecem só na UI do Prometheus, porque não há Alertmanager.
+
 ## Interpretações adotadas
 
 - **Aceite síncrono:** operações sem dependências são concluídas na própria requisição/mensagem, sem commit intermediário de `PENDING`. A única espera durável é `PENDING_REFERENCE`.
@@ -286,7 +294,7 @@ Logs JSON com identificadores de rastreio, métricas Prometheus (resultado por s
 - **IAM do SQS** não é aplicado pelo LocalStack Community (ver acima): as políticas por componente são declarativas localmente; o menor privilégio verificável é o do Postgres.
 - **Ordem global de eventos por carteira** não é estrita com vários relays: o grupo FIFO preserva a ordem de *publicação*, que pode diferir da ordem de commit quando dois relays publicam eventos da mesma carteira ao mesmo tempo. Consumidores devem usar `walletVersion`. Uma alternativa seria reivindicar só o evento mais antigo pendente de cada `partition_key`.
 - **Retenção** de inbox e outbox publicadas não é feita (sem job de limpeza/particionamento).
-- **Partidas dobradas**, **tracing OpenTelemetry** e **dashboards** não implementados.
+- **Partidas dobradas** e **tracing OpenTelemetry** não implementados. Os dashboards e alertas existem (profile `observability`), mas sem Alertmanager: não há roteamento de notificações.
 - **Reembolso novamente após `ROLLBACK` de `REFUND`** não é suportado (política conservadora descrita acima).
 - **Keycloak em modo dev** (`start-dev`, HTTP, banco embutido) — adequado apenas para ambiente local.
 - **Moedas** limitadas às de 2 casas decimais.

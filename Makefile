@@ -1,13 +1,16 @@
-.PHONY: up deps down build test test-race vet fmt integration integration-race migrate-up migrate-down demo sqs-demo
+.PHONY: up observability deps down build test test-race vet fmt integration integration-race migrate-up migrate-down demo sqs-demo
 
-up:            ## full stack: postgres, keycloak, localstack, migrations and 3 API instances
+up:            ## full stack: postgres, keycloak, localstack, migrations and all service components
 	docker compose up --build -d
+
+observability: ## full stack + Prometheus (http://localhost:9090) and Grafana (http://localhost:3000)
+	docker compose --profile observability up --build -d
 
 deps:          ## only the dependencies used by the integration tests
 	docker compose up -d --wait postgres keycloak localstack
 
 down:
-	docker compose down -v
+	docker compose --profile observability down -v
 
 build:
 	go build -o bin/wallet-service ./cmd/wallet-service
